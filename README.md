@@ -53,6 +53,16 @@ sudo .venv/bin/dro benchmark example.com
 
 `dro adguard check` performs only a rewrite-list read. `dro benchmark` reads the current rewrite when AdGuard is available, adds its IP to public DNS candidates, benchmarks the candidates, and prints a decision. Both commands are read-only and never apply a DNS change.
 
+## API (Phase 3)
+
+After applying the Alembic migration, run the API locally with:
+
+```sh
+uvicorn app.api.application:app --host 127.0.0.1 --port 8000
+```
+
+The API provides `/health`, `/api/v1/system/status`, target CRUD, read-only manual benchmark, benchmark history, rewrite history, and current rewrite lookup. It does not modify AdGuard DNS.
+
 ## AdGuard credentials
 
 Store real credentials only in `/etc/dro/dro.env`. The service reads this file at runtime; process environment values override file entries.

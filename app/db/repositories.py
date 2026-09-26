@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import selectinload
 
 from app.db.models import (
     AuditLogRecord, BenchmarkResultRecord, BenchmarkRunRecord, BenchmarkSampleRecord,
@@ -16,9 +17,10 @@ from app.models.target import Target
 from app.security import is_secret_key, sanitize_for_storage
 
 
-def save_target(session: Session, target: Target) -> TargetRecord:
+def save_target(session: Session, target: Target, record: TargetRecord | None = None) -> TargetRecord:
     values = sanitize_for_storage(target.model_dump())
-    record = session.scalar(select(TargetRecord).where(TargetRecord.hostname == target.hostname))
+    if record is None:
+        record = session.scalar(select(TargetRecord).where(TargetRecord.hostname == target.hostname))
     if record is None:
         record = TargetRecord(**values)
         session.add(record)
@@ -32,6 +34,18 @@ def save_target(session: Session, target: Target) -> TargetRecord:
 
 def get_target(session: Session, hostname: str) -> TargetRecord | None:
     return session.scalar(select(TargetRecord).where(TargetRecord.hostname == hostname))
+
+
+def get_target_by_id(session: Session, target_id: int) -> TargetRecord | None:
+    return session.get(TargetRecord, target_id)
+
+
+def list_targets(session: Session) -> list[TargetRecord]:
+    return list(session.scalars(select(TargetRecord).order_by(TargetRecord.hostname)).all())
+
+
+def delete_target(session: Session, record: TargetRecord) -> None:
+    session.delete(record)
 
 
 def save_benchmark_run(session: Session, target_id: int, results: Sequence[BenchmarkResult],
@@ -122,3 +136,27 @@ def add_audit_event(session: Session, event: str, target_id: int | None = None,
     session.add(record)
     session.flush()
     return record
+
+
+def list_benchmark_runs(session: Session, target_id: int) -> list[BenchmarkRunRecord]:
+    return list(session.scalars(select(BenchmarkRunRecord).where(BenchmarkRunRecord.target_id == target_id)
+                                .order_by(BenchmarkRunRecord.completed_at.desc())).all())
+
+
+def get_benchmark_run(session: Session, run_id: int) -> BenchmarkRunRecord | None:
+    return session.scalar(select(BenchmarkRunRecord).options(
+        selectinload(BenchmarkRunRecord.results).selectinload(BenchmarkResultRecord.samples)
+    ).where(BenchmarkRunRecord.id == run_id))
+
+
+def list_rewrite_history(session: Session, target_id: int) -> list[RewriteHistoryRecord]:
+    return list(session.scalars(select(RewriteHistoryRecord).where(RewriteHistoryRecord.target_id == target_id)
+                                .order_by(RewriteHistoryRecord.created_at.desc())).all())
+
+
+def count_targets(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(TargetRecord)) or 0
+
+
+def count_benchmark_runs(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(BenchmarkRunRecord)) or 0

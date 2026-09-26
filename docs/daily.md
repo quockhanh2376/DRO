@@ -15,3 +15,10 @@
 - Connected the read-only benchmark CLI to stored target settings, candidate results, decision reasons, current rewrite state, and consecutive-win state.
 - Added temporary SQLite and migration round-trip tests. No DNS mutation, cleanup jobs, API, or UI were added.
 - Database files are created with owner-only permissions; the schema contains no credential fields.
+
+## 2026-09-26 — Phase 3 FastAPI API
+
+- Added an ASGI app entry point and health/system status endpoints.
+- Added target CRUD, read-only manual benchmark, benchmark/run history, rewrite history, and current rewrite lookup.
+- Extracted the shared read-only benchmark cycle for CLI/API reuse; routes contain no decision logic and no DNS mutation.
+- Added TestClient coverage with temporary SQLite. Web UI and authentication remain out of scope.

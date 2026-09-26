@@ -37,9 +37,10 @@ class TargetRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
-    benchmark_runs: Mapped[list["BenchmarkRunRecord"]] = relationship(back_populates="target")
-    optimizer_state: Mapped["OptimizerStateRecord | None"] = relationship(back_populates="target", uselist=False)
-    rewrite_history: Mapped[list["RewriteHistoryRecord"]] = relationship(back_populates="target")
+    benchmark_runs: Mapped[list["BenchmarkRunRecord"]] = relationship(back_populates="target", passive_deletes=True)
+    optimizer_state: Mapped["OptimizerStateRecord | None"] = relationship(
+        back_populates="target", uselist=False, passive_deletes=True)
+    rewrite_history: Mapped[list["RewriteHistoryRecord"]] = relationship(back_populates="target", passive_deletes=True)
 
 
 class BenchmarkRunRecord(Base):

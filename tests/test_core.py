@@ -14,6 +14,7 @@ from app.integrations.adguard import AdGuardClient, discover_adguard
 from app.models.benchmark import BenchmarkResult, BenchmarkSample, PendingCandidateState
 from app.models.target import Target
 from app.core import benchmark as benchmark_module
+from app.core import optimizer as optimizer_module
 from app import main as main_module
 from app.security import load_secret_environment, redact_secrets
 from app.db.database import Database
@@ -221,10 +222,10 @@ def test_cli_includes_current_rewrite_and_decides(monkeypatch, capsys, tmp_path)
         def benchmark(self, hostname, ips, **kwargs):
             assert ips == ["1.1.1.1", "9.9.9.9"]
             return [result("1.1.1.1", 100), result("9.9.9.9", 200)]
-    monkeypatch.setattr(main_module, "AdGuardClient", FakeAdGuard)
-    monkeypatch.setattr(main_module, "discover_adguard", lambda configured_url: ["http://adguard"])
-    monkeypatch.setattr(main_module, "PublicDnsDiscovery", FakeDiscovery)
-    monkeypatch.setattr(main_module, "HttpsBenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(optimizer_module, "AdGuardClient", FakeAdGuard)
+    monkeypatch.setattr(optimizer_module, "discover_adguard", lambda configured_url: ["http://adguard"])
+    monkeypatch.setattr(optimizer_module, "PublicDnsDiscovery", FakeDiscovery)
+    monkeypatch.setattr(optimizer_module, "HttpsBenchmarkRunner", FakeRunner)
     db_url = f"sqlite:///{(tmp_path / 'cli.db').as_posix()}"
     db = Database(db_url)
     Base.metadata.create_all(db.engine)
