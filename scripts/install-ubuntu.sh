@@ -12,6 +12,12 @@ ENV_FILE="${DRO_ENV_FILE:-/etc/dro/dro.env}"
 PYTHON="${DRO_PYTHON:-python3.12}"
 DATABASE_URL="sqlite:////${DATABASE_PATH#/}"
 
+path_is_within() {
+  local resolved
+  resolved="$(realpath -m -- "$1")"
+  [[ "$resolved" == "$2" || "$resolved" == "$2/"* ]]
+}
+
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run with sudo: sudo $0" >&2
   exit 1
@@ -23,6 +29,10 @@ fi
 [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ && "$LOGROTATE_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Invalid unit or logrotate name." >&2; exit 1; }
 [[ "$LISTEN_PORT" =~ ^[0-9]{1,5}$ ]] && (( LISTEN_PORT >= 1024 && LISTEN_PORT <= 65535 )) || { echo "DRO_LISTEN_PORT must be between 1024 and 65535." >&2; exit 1; }
 command -v "$PYTHON" >/dev/null || { echo "$PYTHON is required (Python 3.12+)." >&2; exit 1; }
+path_is_within "$DEST_DIR" /opt/dro || { echo "DRO_INSTALL_DIR resolves outside /opt/dro." >&2; exit 1; }
+path_is_within "$DATABASE_PATH" /var/lib/dro || { echo "DRO_DATABASE_PATH resolves outside /var/lib/dro." >&2; exit 1; }
+path_is_within "$LOG_FILE" /var/log/dro || { echo "DRO_LOG_FILE resolves outside /var/log/dro." >&2; exit 1; }
+path_is_within "$ENV_FILE" /etc/dro && [[ "$(realpath -m -- "$ENV_FILE")" != /etc/dro ]] || { echo "DRO_ENV_FILE must resolve to a file under /etc/dro." >&2; exit 1; }
 "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' || { echo "Python 3.12 or newer is required." >&2; exit 1; }
 
 getent group dro >/dev/null || groupadd --system dro
@@ -71,7 +81,7 @@ chmod 0600 "$ENV_FILE"
 
 if ! grep -q '^DRO_ADMIN_PASSWORD=.' "$ENV_FILE" || ! grep -q '^DRO_SESSION_SECRET=.' "$ENV_FILE"; then
   echo "Set DRO_ADMIN_USER, DRO_ADMIN_PASSWORD, and DRO_SESSION_SECRET in $ENV_FILE, then rerun this installer."
-  exit 0
+  exit 1
 fi
 
 cd "$DEST_DIR"

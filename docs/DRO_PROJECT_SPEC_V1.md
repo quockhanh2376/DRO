@@ -10,6 +10,8 @@ Initial targets:
 
 DRO does **not** replace AdGuard Home or CDN routing. It only optimizes explicitly configured targets.
 
+The supported target scope is HTTPS/Web only. The application and scheduler run as one DRO instance on one host.
+
 ### 2. Tech stack
 - Python 3.12+
 - FastAPI
@@ -18,7 +20,6 @@ DRO does **not** replace AdGuard Home or CDN routing. It only optimizes explicit
 - Alembic
 - Pydantic
 - httpx
-- APScheduler
 - Jinja2 + HTMX
 - systemd
 - AdGuard Home API
@@ -151,7 +152,7 @@ curl --http1.1   --no-keepalive   -H "Connection: close"   --resolve "hostname:4
 ```
 
 Metrics:
-- TCP connect time
+- TCP connect time measured as part of each HTTPS request
 - TLS handshake time
 - total time
 - HTTP status
@@ -425,11 +426,6 @@ immediate_failover = true
 - manual lock
 - retention
 - installer/systemd
-
-#### Phase 6 — TCP/RDS targets
-- TCP connect benchmark
-- custom ports
-- static candidate IP lists
 
 ### 20. v1 definition of done
 DRO v1 is complete when:

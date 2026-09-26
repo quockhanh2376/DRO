@@ -6,7 +6,7 @@
 - Implemented public Google DNS-over-HTTPS discovery, curl-based HTTPS benchmarking, statistics, and decision rules.
 - Added AdGuard DNS rewrite API client and a read-only `dro benchmark` CLI.
 - Added unit tests and documented local setup and usage.
-- At v0.1.0, persistence, API, UI, scheduler, TCP/RDS, and deployment had not yet been implemented.
+- At v0.1.0, persistence, API, UI, scheduler, and deployment had not yet been implemented.
 
 ## 2026-09-26 — Phase 2 SQLite persistence
 

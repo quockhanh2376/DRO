@@ -9,6 +9,7 @@ import subprocess
 from typing import Callable, Sequence
 
 from app.models.benchmark import BenchmarkResult, BenchmarkSample
+from app.security import redact_secrets
 
 logger = logging.getLogger(__name__)
 REVOCATION_OFFLINE = "CRYPT_E_REVOCATION_OFFLINE"
@@ -39,7 +40,6 @@ class HttpsBenchmarkRunner:
 
     def benchmark_ip(self, hostname: str, ip: str, path: str = "/", port: int = 443) -> BenchmarkResult:
         samples: list[BenchmarkSample] = []
-        url = f"https://{hostname}{path}"
         logger.info("Benchmark started host=%s ip=%s runs=%d", hostname, ip, self.runs_per_ip)
         for number in range(1, self.runs_per_ip + 1):
             command = self._command(hostname, ip, path, port)
@@ -65,8 +65,9 @@ class HttpsBenchmarkRunner:
                 if not sample.valid:
                     sample.error = "HTTP status outside accepted range 200-399 or missing timings"
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                sample = BenchmarkSample(ip=ip, run_number=number, error=str(exc))
-                logger.debug("Benchmark run failed host=%s ip=%s run=%d error=%s", hostname, ip, number, exc)
+                sample = BenchmarkSample(ip=ip, run_number=number, error=redact_secrets(exc))
+                logger.debug("Benchmark run failed host=%s ip=%s run=%d error_type=%s",
+                             hostname, ip, number, type(exc).__name__)
             samples.append(sample)
         aggregate = calculate_statistics(samples, self.runs_per_ip)
         logger.info("Benchmark finished host=%s ip=%s valid=%d/%d healthy=%s avg_ms=%s",

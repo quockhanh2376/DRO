@@ -4,18 +4,21 @@ import pytest
 from sqlalchemy import func, select
 
 from app.core import optimizer
+from app.core.discovery import DiscoveryError
 from app.db.database import Database
 from app.db.models import AuditLogRecord, Base, BenchmarkRunRecord, OptimizerStateRecord
 from app.db.repositories import save_target
+from app.integrations.adguard import AdGuardError
 from app.models.benchmark import BenchmarkResult
 from app.models.target import Target
 
 
 @pytest.mark.parametrize("endpoints", [[], ["http://one", "http://two"]])
 def test_adguard_lookup_requires_exactly_one_endpoint(monkeypatch, endpoints):
-    monkeypatch.setattr(optimizer, "load_secret_environment", lambda: None)
-    monkeypatch.setattr(optimizer, "discover_adguard", lambda _url: endpoints)
-    monkeypatch.setattr(optimizer, "AdGuardClient", lambda **_kwargs: pytest.fail("must not connect"))
+    def unavailable():
+        raise AdGuardError("AdGuard endpoint is unavailable or ambiguous")
+
+    monkeypatch.setattr(optimizer, "configured_adguard_client", unavailable)
     assert optimizer.read_adguard_rewrite("example.com") == (None, False)
 
 
@@ -54,6 +57,36 @@ def test_public_ips_remain_distinct_from_ordered_candidates(monkeypatch, tmp_pat
         assert output["candidate_ips"] == list(dict.fromkeys([*public, "9.9.9.9", "8.8.8.8"]))
         assert output["current_rewrite_included"] is True
         assert output["current_rewrite_in_public_dns"] is current_is_public
+    db.close()
+
+
+def test_discovery_failure_keeps_current_rewrite_and_persists_failed_run(monkeypatch, tmp_path):
+    class Discovery:
+        def discover(self, _hostname):
+            raise DiscoveryError("public DNS unavailable")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(optimizer, "PublicDnsDiscovery", Discovery)
+    monkeypatch.setattr(optimizer, "read_adguard_rewrite", lambda _host: ("9.9.9.9", True))
+    monkeypatch.setattr(optimizer, "HttpsBenchmarkRunner",
+                        lambda *_args: pytest.fail("DNS failure must skip network benchmarks"))
+    db = Database(f"sqlite:///{(tmp_path / 'discovery-failure.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    with db.session() as session:
+        target = save_target(session, Target(hostname="discovery-failure.example"))
+        output = optimizer.run_benchmark_cycle(session, target)
+        assert output["decision"]["action"] == "KEEP"
+        assert output["decision"]["current_ip"] == "9.9.9.9"
+        assert output["candidate_ips"] == ["9.9.9.9"]
+        assert output["candidates"] == []
+
+    with db.session() as session:
+        run = session.get(BenchmarkRunRecord, output["benchmark_run_id"])
+        assert run and run.summary["discovery_error"] == "public DNS unavailable"
+        assert session.scalar(select(func.count()).select_from(AuditLogRecord)) == 1
     db.close()
 
 

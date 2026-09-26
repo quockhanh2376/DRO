@@ -107,6 +107,9 @@ def test_initial_alembic_upgrade_downgrade_upgrade(tmp_path, monkeypatch):
     columns = {column["name"] for table in table_names for column in inspect(engine_db.engine).get_columns(table)}
     assert "password" not in columns
     assert "password_hash" in columns
+    indexes = {index["name"] for table in ("benchmark_runs", "rewrite_history")
+               for index in inspect(engine_db.engine).get_indexes(table)}
+    assert {"ix_benchmark_runs_target_completed", "ix_rewrite_history_target_created"} <= indexes
     engine_db.close()
     command.downgrade(config, "base")
     engine_db = Database(f"sqlite:///{path.as_posix()}")

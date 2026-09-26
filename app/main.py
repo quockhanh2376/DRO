@@ -9,7 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-from app.core.discovery import DiscoveryError
 from app.core.optimizer import run_benchmark_cycle
 from app.db.database import Database, database_url, sqlite_file_path
 from app.db.retention import cleanup_retention
@@ -32,11 +31,6 @@ def benchmark_command(hostname: str) -> int:
         with database.session() as session:
             record = get_target(session, hostname) or save_target(session, default_target)
             output = run_benchmark_cycle(session, record)
-    except DiscoveryError as exc:
-        logger.error("Benchmark discovery failed host=%s error=%s", hostname, exc)
-        print(f"Discovery failed: {exc}", file=sys.stderr)
-        database.close()
-        return 1
     except SQLAlchemyError as exc:
         logger.error("Database unavailable during benchmark setup host=%s error=%s", hostname, type(exc).__name__)
         print("Database unavailable or not migrated; run 'alembic upgrade head'.", file=sys.stderr)

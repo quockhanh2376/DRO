@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
-import os
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -16,27 +16,34 @@ from app.db.repositories import (
     add_audit_event, get_current_rewrite_ip, get_pending_state, save_benchmark_run,
     save_optimizer_state,
 )
-from app.integrations.adguard import AdGuardClient, AdGuardError, discover_adguard
-from app.models.benchmark import PendingCandidateState
+from app.integrations.adguard import AdGuardError, configured_adguard_client
+from app.models.benchmark import DecisionResult, PendingCandidateState
 from app.models.target import Target
-from app.security import load_secret_environment
 
 logger = logging.getLogger(__name__)
 
 
 def read_adguard_rewrite(hostname: str) -> tuple[str | None, bool]:
     """Return (IP, lookup_succeeded); never changes AdGuard state."""
-    load_secret_environment()
-    endpoints = discover_adguard(os.getenv("ADGUARD_URL"))
-    if not endpoints:
+    try:
+        client = configured_adguard_client()
+    except AdGuardError as exc:
+        logger.warning("Current AdGuard rewrite unavailable host=%s error=%s", hostname, exc)
         return None, False
-    if len(endpoints) > 1:
-        logger.warning("Multiple AdGuard instances found; configure ADGUARD_URL to select one")
-        return None, False
-    client = AdGuardClient(base_url=endpoints[0])
     try:
         rewrite = client.get_rewrite(hostname)
-        return (rewrite.get("answer") if rewrite else None), True
+        if rewrite is None:
+            return None, True
+        answer = rewrite["answer"]
+        try:
+            parsed = ipaddress.ip_address(answer)
+        except ValueError:
+            logger.warning("Current AdGuard rewrite is not an IP address host=%s", hostname)
+            return None, False
+        if parsed.version != 4:
+            logger.warning("Current AdGuard rewrite is not IPv4 host=%s", hostname)
+            return None, False
+        return str(parsed), True
     except AdGuardError as exc:
         logger.warning("Current AdGuard rewrite unavailable host=%s error=%s", hostname, exc)
         return None, False
@@ -49,35 +56,49 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
     config = Target.model_validate(record, from_attributes=True)
     pending = get_pending_state(session, record.id)
     stored_current_ip = get_current_rewrite_ip(session, record.id)
+    discovery = PublicDnsDiscovery()
+    discovery_error = None
+    try:
+        public_ips = discovery.discover(config.hostname)
+    except DiscoveryError as exc:
+        public_ips = []
+        discovery_error = str(exc)
+        logger.warning("Public DNS discovery failed host=%s error_type=%s",
+                       config.hostname, type(exc).__name__)
+    finally:
+        discovery.close()
+
     current_ip, lookup_succeeded = read_adguard_rewrite(config.hostname)
     if not lookup_succeeded:
         current_ip = stored_current_ip
-
-    discovery = PublicDnsDiscovery()
-    try:
-        public_ips = discovery.discover(config.hostname)
-    finally:
-        discovery.close()
     current_rewrite_in_public_dns = bool(current_ip and current_ip in public_ips)
     candidate_ips = list(dict.fromkeys(
         [*public_ips, *([current_ip] if current_ip else []),
          *([config.manual_lock_ip] if config.manual_lock_ip else [])]
     ))
-    if not candidate_ips:
-        raise DiscoveryError(f"No public IPv4 A records found for {config.hostname}")
-
-    results = HttpsBenchmarkRunner(config.runs_per_ip, config.timeout_seconds).benchmark(
-        config.hostname, candidate_ips, path=config.path, port=config.port)
-    results_by_ip = {result.ip: result for result in results}
-    current = results_by_ip.get(current_ip)
-    decision = DecisionEngine().decide(
-        current_ip, current, results, pending=pending,
-        switch_threshold_ms=config.switch_threshold_ms,
-        switch_threshold_percent=config.switch_threshold_percent,
-        required_consecutive_wins=config.required_consecutive_wins,
-        manual_lock_ip=config.manual_lock_ip,
-        immediate_switch_if_current_unhealthy=config.immediate_switch_if_current_unhealthy,
-    )
+    results = []
+    if discovery_error:
+        decision = DecisionResult(
+            action="LOCKED" if config.manual_lock_ip else "KEEP",
+            current_ip=current_ip, candidate_ip=config.manual_lock_ip,
+            reason=("Manual lock is active; automatic rewrite is disabled." if config.manual_lock_ip
+                    else "Public DNS discovery failed; current rewrite retained."),
+        )
+    elif not candidate_ips:
+        decision = DecisionResult(action="KEEP", current_ip=current_ip,
+                                  reason="No public IPv4 candidates or current rewrite are available.")
+    else:
+        results = HttpsBenchmarkRunner(config.runs_per_ip, config.timeout_seconds).benchmark(
+            config.hostname, candidate_ips, path=config.path, port=config.port)
+        results_by_ip = {result.ip: result for result in results}
+        decision = DecisionEngine().decide(
+            current_ip, results_by_ip.get(current_ip), results, pending=pending,
+            switch_threshold_ms=config.switch_threshold_ms,
+            switch_threshold_percent=config.switch_threshold_percent,
+            required_consecutive_wins=config.required_consecutive_wins,
+            manual_lock_ip=config.manual_lock_ip,
+            immediate_switch_if_current_unhealthy=config.immediate_switch_if_current_unhealthy,
+        )
     next_pending = (PendingCandidateState(candidate_ip=decision.candidate_ip, consecutive_wins=decision.wins)
                     if decision.action in ("HOLD", "UPDATE") else PendingCandidateState())
     summary = {"current_rewrite_ip": current_ip,
@@ -85,7 +106,7 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
                "candidate_ips": candidate_ips,
                "current_rewrite_included": bool(current_ip and current_ip in candidate_ips),
                "current_rewrite_in_public_dns": current_rewrite_in_public_dns,
-               "candidate_count": len(results)}
+               "candidate_count": len(results), "discovery_error": discovery_error}
     with session.begin_nested():
         run = save_benchmark_run(session, record.id, results, summary=summary, decision=decision)
         save_optimizer_state(session, record.id, current_ip, next_pending, decision)

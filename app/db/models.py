@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -45,6 +45,7 @@ class TargetRecord(Base):
 
 class BenchmarkRunRecord(Base):
     __tablename__ = "benchmark_runs"
+    __table_args__ = (Index("ix_benchmark_runs_target_completed", "target_id", "completed_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     target_id: Mapped[int] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), index=True)
@@ -110,6 +111,7 @@ class OptimizerStateRecord(Base):
 
 class RewriteHistoryRecord(Base):
     __tablename__ = "rewrite_history"
+    __table_args__ = (Index("ix_rewrite_history_target_created", "target_id", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id", ondelete="SET NULL"), nullable=True, index=True)

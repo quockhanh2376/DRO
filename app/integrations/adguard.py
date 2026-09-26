@@ -68,7 +68,13 @@ class AdGuardClient:
         try:
             response = self._client.request(method, f"{self.base_url}/control/{path.lstrip('/')}", **kwargs)
             response.raise_for_status()
-            return response.json() if response.content else None
+            if not response.content:
+                return None
+            try:
+                return response.json()
+            except ValueError as exc:
+                logger.error("AdGuard API returned malformed JSON method=%s path=%s", method, path)
+                raise AdGuardError(f"AdGuard API {method} {path} returned malformed JSON") from exc
         except httpx.HTTPError as exc:
             # Do not include request headers, client repr, or credentials in error text.
             logger.error("AdGuard API request failed method=%s path=%s error=%s", method,
@@ -77,12 +83,17 @@ class AdGuardClient:
 
     def list_rewrites(self) -> list[dict[str, Any]]:
         result = self._request("GET", "rewrite/list")
-        if not isinstance(result, list):
+        if (not isinstance(result, list) or
+                any(not isinstance(item, dict) or not isinstance(item.get("domain"), str)
+                    or not isinstance(item.get("answer"), str) for item in result)):
             raise AdGuardError("AdGuard API returned an invalid rewrite list")
         return result
 
     def get_rewrite(self, domain: str) -> dict[str, Any] | None:
-        return next((item for item in self.list_rewrites() if item.get("domain") == domain), None)
+        matches = [item for item in self.list_rewrites() if item["domain"] == domain]
+        if len(matches) > 1:
+            raise AdGuardError("AdGuard API returned multiple rewrites for the same domain")
+        return matches[0] if matches else None
 
     def add_rewrite(self, domain: str, answer: str) -> Any:
         return self._request("POST", "rewrite/add", json={"domain": domain, "answer": answer})
@@ -96,3 +107,12 @@ class AdGuardClient:
 
     def delete_rewrite(self, domain: str, answer: str) -> Any:
         return self._request("POST", "rewrite/delete", json={"domain": domain, "answer": answer})
+
+
+def configured_adguard_client() -> AdGuardClient:
+    """Create a client only when runtime configuration identifies one endpoint."""
+    load_secret_environment()
+    endpoints = discover_adguard(os.getenv("ADGUARD_URL"))
+    if len(endpoints) != 1:
+        raise AdGuardError("AdGuard endpoint is unavailable or ambiguous")
+    return AdGuardClient(base_url=endpoints[0])

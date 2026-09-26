@@ -1,6 +1,6 @@
 # DRO — DNS Route Optimizer
 
-DRO discovers and benchmarks public HTTPS endpoints, stores results in SQLite, and can safely update explicitly configured AdGuard Home rewrites. The service is intended for one Ubuntu host and one local administrator.
+DRO supports HTTPS/Web targets only. It discovers and benchmarks public HTTPS endpoints, stores results in SQLite, and can safely update explicitly configured AdGuard Home rewrites. The service is intended for one Ubuntu host and one local administrator.
 
 ## Development setup
 

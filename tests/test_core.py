@@ -10,7 +10,10 @@ import pytest
 from app.core.benchmark import calculate_statistics
 from app.core.decision import DecisionEngine, rank_candidates
 from app.core.discovery import DiscoveryError, PublicDnsDiscovery
-from app.integrations.adguard import AdGuardClient, discover_adguard
+from app.integrations.adguard import (
+    AdGuardClient, AdGuardError, configured_adguard_client, discover_adguard,
+)
+from app.integrations import adguard as adguard_module
 from app.models.benchmark import BenchmarkResult, BenchmarkSample, PendingCandidateState
 from app.models.target import Target
 from app.core import benchmark as benchmark_module
@@ -121,6 +124,41 @@ def test_adguard_mocked_api_operations():
     assert "secret" not in repr(adguard)
 
 
+@pytest.mark.parametrize("endpoints", [[], ["http://one", "http://two"], ["http://one"]])
+def test_configured_adguard_client_requires_exactly_one_endpoint(monkeypatch, endpoints):
+    monkeypatch.setattr(adguard_module, "load_secret_environment", lambda: None)
+    monkeypatch.setattr(adguard_module, "discover_adguard", lambda _url: endpoints)
+    monkeypatch.setattr(adguard_module, "AdGuardClient", lambda base_url: base_url)
+    if len(endpoints) == 1:
+        assert configured_adguard_client() == endpoints[0]
+    else:
+        with pytest.raises(AdGuardError, match="unavailable or ambiguous"):
+            configured_adguard_client()
+
+
+def test_adguard_malformed_or_ambiguous_rewrite_response_fails_safely():
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=[{"domain": "example.com", "answer": "1.2.3.4"},
+                                                    {"domain": "example.com", "answer": "5.6.7.8"}])))
+    adguard = AdGuardClient("http://adguard", client=client)
+    with pytest.raises(AdGuardError, match="multiple rewrites"):
+        adguard.get_rewrite("example.com")
+
+    malformed = httpx.Client(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, content=b"not-json")))
+    with pytest.raises(AdGuardError, match="malformed JSON"):
+        AdGuardClient("http://adguard", client=malformed).list_rewrites()
+
+
+def test_benchmark_errors_redact_query_secrets():
+    def failed(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 2, "", "failed https://example.com/?token=private-value")
+
+    result = benchmark_module.HttpsBenchmarkRunner(runs_per_ip=1, command_runner=failed).benchmark_ip(
+        "example.com", "1.2.3.4", path="/?token=private-value")
+    assert result.samples[0].error == "failed https://example.com/?token=[REDACTED]"
+
+
 def test_adguard_discovery_uses_configured_url_without_scanning():
     calls = []
     found = discover_adguard("http://adguard.local/", subnet="192.168.1.0/24",
@@ -222,8 +260,7 @@ def test_cli_includes_current_rewrite_and_decides(monkeypatch, capsys, tmp_path)
         def benchmark(self, hostname, ips, **kwargs):
             assert ips == ["1.1.1.1", "9.9.9.9"]
             return [result("1.1.1.1", 100), result("9.9.9.9", 200)]
-    monkeypatch.setattr(optimizer_module, "AdGuardClient", FakeAdGuard)
-    monkeypatch.setattr(optimizer_module, "discover_adguard", lambda configured_url: ["http://adguard"])
+    monkeypatch.setattr(optimizer_module, "configured_adguard_client", lambda: FakeAdGuard())
     monkeypatch.setattr(optimizer_module, "PublicDnsDiscovery", FakeDiscovery)
     monkeypatch.setattr(optimizer_module, "HttpsBenchmarkRunner", FakeRunner)
     db_url = f"sqlite:///{(tmp_path / 'cli.db').as_posix()}"

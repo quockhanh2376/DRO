@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
@@ -14,19 +13,14 @@ from app.db.repositories import (
     add_audit_event, add_rewrite_history, count_automatic_rewrites_since,
     get_setting, set_setting,
 )
-from app.integrations.adguard import AdGuardClient, AdGuardError, discover_adguard
+from app.integrations.adguard import AdGuardClient, AdGuardError, configured_adguard_client
 from app.models.target import Target
-from app.security import load_secret_environment
 
 logger = logging.getLogger(__name__)
 
 
 def _adguard_client() -> AdGuardClient:
-    load_secret_environment()
-    endpoints = discover_adguard(os.getenv("ADGUARD_URL"))
-    if len(endpoints) != 1:
-        raise AdGuardError("AdGuard endpoint is unavailable or ambiguous")
-    return AdGuardClient(base_url=endpoints[0])
+    return configured_adguard_client()
 
 
 def _write(client: AdGuardClient, hostname: str, old_ip: str | None, new_ip: str | None) -> None:
@@ -102,13 +96,17 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
         return {"changed": True, "rolled_back": True, "old_ip": old_ip,
                 "new_ip": new_ip, "healthy": False}
     except Exception:
-        session.rollback()
+        try:
+            session.rollback()
+        except Exception as database_rollback_error:
+            logger.error("Database rollback failed after rewrite attempt host=%s error=%s",
+                         target.hostname, type(database_rollback_error).__name__)
         if mutation_started:
             try:
                 _write(client, target.hostname, new_ip, old_ip)
             except Exception as rollback_error:
-                logger.error("Compensating rewrite failed host=%s error=%s",
-                             target.hostname, type(rollback_error).__name__)
+                logger.critical("Compensating rewrite failed host=%s error=%s",
+                                target.hostname, type(rollback_error).__name__)
         raise
     finally:
         client.close()

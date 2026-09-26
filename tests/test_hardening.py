@@ -134,6 +134,50 @@ def test_failed_post_change_health_immediately_rolls_back(tmp_path, monkeypatch)
     db.close()
 
 
+def test_database_failure_after_rewrite_compensates_external_change(tmp_path, monkeypatch):
+    db = Database(f"sqlite:///{(tmp_path / 'persist-before-dns.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    class FakeAdGuard:
+        ip = "192.0.2.1"
+        def get_rewrite(self, _host): return {"answer": self.ip}
+        def update_rewrite(self, _old_host, _old_ip, _host, ip): self.ip = ip
+        def add_rewrite(self, _host, ip): self.ip = ip
+        def delete_rewrite(self, _host, _ip): self.ip = None
+        def close(self): pass
+
+    client = FakeAdGuard()
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: client)
+    monkeypatch.setattr(rewrites, "_healthy", lambda _target, _ip: True)
+    with db.session() as session:
+        target = save_target(session, Target(hostname="persist-before-dns.example"))
+        target_id = target.id
+
+    with db.session_factory() as session:
+        target = session.get(TargetRecord, target_id)
+        commit = session.commit
+        commit_count = 0
+
+        def fail_after_external_write():
+            nonlocal commit_count
+            commit_count += 1
+            if commit_count == 2:
+                raise RuntimeError("simulated final database failure")
+            commit()
+
+        monkeypatch.setattr(session, "commit", fail_after_external_write)
+        with pytest.raises(RuntimeError, match="final database failure"):
+            rewrites.set_rewrite(session, target, "192.0.2.2", "test")
+
+    assert client.ip == "192.0.2.1"
+    with db.session() as session:
+        assert session.get(OptimizerStateRecord, target_id) is None
+        assert session.scalar(select(RewriteHistoryRecord.id)) is None
+        assert session.scalar(select(AuditLogRecord.event).where(
+            AuditLogRecord.event == "rewrite_change_started"))
+    db.close()
+
+
 def test_daily_auto_change_limit_falls_back_to_recommend(tmp_path, monkeypatch):
     db = Database(f"sqlite:///{(tmp_path / 'limit.db').as_posix()}")
     Base.metadata.create_all(db.engine)
