@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}DRO{% endblock %} · DNS Route Optimizer</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+</head>
+<body hx-boost="true">
+  <header class="topbar"><a class="brand" href="/">DRO</a><nav>
+    <a href="/">Dashboard</a><a href="/targets">Targets</a><a href="/history">History</a><a href="/settings">Settings</a>
+  </nav></header>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

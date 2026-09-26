@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">Overview</p><h1>Dashboard</h1></div><a class="button" href="/targets">Manage targets</a></div>
+<section class="table-wrap"><table><thead><tr><th>Target</th><th>Current IP</th><th>Best candidate</th><th>Current avg</th><th>Best avg</th><th>Improvement</th><th>Win state</th><th>Mode</th><th>Status</th><th>Last test</th><th>Next test</th></tr></thead>
+<tbody>{% for row in rows %}<tr><td><a href="/targets/{{ row.target.id }}">{{ row.target.hostname }}</a></td>
+<td>{{ row.state.current_rewrite_ip if row.state and row.state.current_rewrite_ip else "—" }}</td><td>{{ row.best.ip if row.best else "—" }}</td>
+<td>{{ "%.1f ms"|format(row.current.average_ms) if row.current and row.current.average_ms is not none else "—" }}</td>
+<td>{{ "%.1f ms"|format(row.best.average_ms) if row.best and row.best.average_ms is not none else "—" }}</td>
+<td>{{ "%.1f%%"|format(row.improvement) if row.improvement is not none else "—" }}</td>
+<td>{{ row.wins }}/{{ row.target.required_consecutive_wins }}</td><td>{{ row.target.mode }}</td><td><span class="status">{{ row.status }}</span></td>
+<td>{{ row.run.completed_at.strftime("%Y-%m-%d %H:%M UTC") if row.run else "—" }}</td>
+<td>{{ row.next_run.strftime("%Y-%m-%d %H:%M UTC") if row.next_run else "—" }}</td></tr>
+{% else %}<tr><td colspan="11" class="empty">No targets configured.</td></tr>{% endfor %}</tbody></table></section>
+{% endblock %}

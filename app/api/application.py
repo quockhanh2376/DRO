@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.optimizer import run_benchmark_cycle
@@ -16,7 +19,12 @@ def create_app(database: Database | None = None, benchmark_cycle=run_benchmark_c
     application = FastAPI(title="DRO API", version="0.1.0")
     application.state.database = database
     application.state.benchmark_cycle = benchmark_cycle
+    application.mount("/static", StaticFiles(directory=Path(__file__).resolve().parents[1] / "web" / "static"),
+                      name="static")
     application.include_router(router)
+
+    from app.web.routes import router as web_router
+    application.include_router(web_router)
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(_request: Request, _exc: RequestValidationError) -> JSONResponse:
