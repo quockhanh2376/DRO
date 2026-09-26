@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import re
 from fastapi.testclient import TestClient
 
 from app.api.application import create_app
@@ -14,11 +15,19 @@ from sqlalchemy import select
 
 @pytest.fixture
 def web(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRO_ADMIN_USER", "admin")
+    monkeypatch.setenv("DRO_ADMIN_PASSWORD", "test-admin-password")
     monkeypatch.setenv("ADGUARD_URL", "http://admin:ui-secret@adguard.example")
     database = Database(f"sqlite:///{(tmp_path / 'web.db').as_posix()}")
     Base.metadata.create_all(database.engine)
     app = create_app(database=database, benchmark_cycle=lambda *_args: {})
     with TestClient(app) as client:
+        login_page = client.get("/login")
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', login_page.text).group(1)
+        assert client.post("/login", data={"username": "admin", "password": "test-admin-password",
+                                           "csrf_token": csrf}, follow_redirects=False).status_code == 303
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/targets").text).group(1)
+        client.headers["x-csrf-token"] = csrf
         yield client, database
     database.close()
 

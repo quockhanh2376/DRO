@@ -104,8 +104,9 @@ def test_initial_alembic_upgrade_downgrade_upgrade(tmp_path, monkeypatch):
     table_names = set(inspect(engine_db.engine).get_table_names())
     assert {"targets", "benchmark_runs", "benchmark_results", "benchmark_samples",
             "optimizer_state", "rewrite_history", "settings", "audit_log"}.issubset(table_names)
-    assert all("password" not in column["name"].lower()
-               for table in table_names for column in inspect(engine_db.engine).get_columns(table))
+    columns = {column["name"] for table in table_names for column in inspect(engine_db.engine).get_columns(table)}
+    assert "password" not in columns
+    assert "password_hash" in columns
     engine_db.close()
     command.downgrade(config, "base")
     engine_db = Database(f"sqlite:///{path.as_posix()}")

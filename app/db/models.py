@@ -114,9 +114,10 @@ class RewriteHistoryRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id", ondelete="SET NULL"), nullable=True, index=True)
     old_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
-    new_ip: Mapped[str] = mapped_column(String(45))
+    new_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     reason: Mapped[str] = mapped_column(Text)
     benchmark_run_id: Mapped[int | None] = mapped_column(ForeignKey("benchmark_runs.id", ondelete="SET NULL"), nullable=True)
+    automatic: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
     target: Mapped[TargetRecord] = relationship(back_populates="rewrite_history")
@@ -138,3 +139,21 @@ class AuditLogRecord(Base):
     event: Mapped[str] = mapped_column(String(100), index=True)
     details: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class AdminCredentialRecord(Base):
+    __tablename__ = "admin_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    username: Mapped[str] = mapped_column(String(100))
+    password_hash: Mapped[str] = mapped_column(Text)
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ScheduleStateRecord(Base):
+    __tablename__ = "schedule_state"
+
+    target_id: Mapped[int] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), primary_key=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)

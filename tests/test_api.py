@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import re
 from fastapi.testclient import TestClient
 
 from app.api.application import create_app
@@ -13,6 +14,8 @@ from app.models.benchmark import BenchmarkResult, BenchmarkSample, DecisionResul
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRO_ADMIN_USER", "admin")
+    monkeypatch.setenv("DRO_ADMIN_PASSWORD", "test-admin-password")
     database = Database(f"sqlite:///{(tmp_path / 'api.db').as_posix()}")
     Base.metadata.create_all(database.engine)
 
@@ -31,6 +34,12 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "read_adguard_rewrite", lambda _hostname: (None, False))
     app = create_app(database=database, benchmark_cycle=benchmark_cycle)
     with TestClient(app) as client:
+        login_page = client.get("/login")
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', login_page.text).group(1)
+        assert client.post("/login", data={"username": "admin", "password": "test-admin-password",
+                                           "csrf_token": csrf}, follow_redirects=False).status_code == 303
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/targets").text).group(1)
+        client.headers["x-csrf-token"] = csrf
         yield client, database
     database.close()
 
@@ -58,7 +67,9 @@ def test_target_crud_and_validation_does_not_echo_secrets(api):
     assert invalid.status_code == 422
     secret = client.post("/api/v1/targets", json={"hostname": "safe.example", "ADGUARD_PASS": "never-return"})
     assert secret.status_code == 422 and "never-return" not in secret.text
-    assert client.delete(f"/api/v1/targets/{target_id}").status_code == 204
+    assert client.delete(f"/api/v1/targets/{target_id}").status_code == 400
+    assert client.delete(f"/api/v1/targets/{target_id}",
+                         headers={"x-confirm-action": "confirm"}).status_code == 204
     assert client.get(f"/api/v1/targets/{target_id}").status_code == 404
 
 

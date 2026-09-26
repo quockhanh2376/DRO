@@ -100,11 +100,13 @@ def save_optimizer_state(session: Session, target_id: int, current_ip: str | Non
     return state
 
 
-def add_rewrite_history(session: Session, target_id: int, old_ip: str | None, new_ip: str,
-                        reason: str, benchmark_run_id: int | None = None) -> RewriteHistoryRecord:
+def add_rewrite_history(session: Session, target_id: int, old_ip: str | None, new_ip: str | None,
+                        reason: str, benchmark_run_id: int | None = None,
+                        automatic: bool = False) -> RewriteHistoryRecord:
     record = RewriteHistoryRecord(target_id=target_id,
                                   old_ip=sanitize_for_storage(old_ip), new_ip=sanitize_for_storage(new_ip),
-                                  reason=sanitize_for_storage(reason), benchmark_run_id=benchmark_run_id)
+                                  reason=sanitize_for_storage(reason), benchmark_run_id=benchmark_run_id,
+                                  automatic=automatic)
     session.add(record)
     session.flush()
     return record
@@ -152,6 +154,11 @@ def get_benchmark_run(session: Session, run_id: int) -> BenchmarkRunRecord | Non
 def list_rewrite_history(session: Session, target_id: int) -> list[RewriteHistoryRecord]:
     return list(session.scalars(select(RewriteHistoryRecord).where(RewriteHistoryRecord.target_id == target_id)
                                 .order_by(RewriteHistoryRecord.created_at.desc())).all())
+
+
+def count_automatic_rewrites_since(session: Session, since) -> int:
+    return session.scalar(select(func.count()).select_from(RewriteHistoryRecord).where(
+        RewriteHistoryRecord.automatic.is_(True), RewriteHistoryRecord.created_at >= since)) or 0
 
 
 def count_targets(session: Session) -> int:

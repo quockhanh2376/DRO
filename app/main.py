@@ -7,10 +7,13 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 from app.core.discovery import DiscoveryError
 from app.core.optimizer import run_benchmark_cycle
-from app.db.database import Database
+from app.db.database import Database, database_url, sqlite_file_path
+from app.db.retention import cleanup_retention
+from app.maintenance import backup_database, restore_database
 from app.db.repositories import get_target, save_target
 from app.integrations.adguard import AdGuardClient, AdGuardError, discover_adguard
 from app.models.target import Target
@@ -68,6 +71,47 @@ def adguard_check_command() -> int:
         client.close()
 
 
+def database_backup_command(destination: str) -> int:
+    path = sqlite_file_path(database_url())
+    if path is None:
+        print("Backup supports SQLite databases only.", file=sys.stderr)
+        return 1
+    try:
+        print(backup_database(path, Path(destination)))
+        return 0
+    except (OSError, ValueError) as exc:
+        print(f"Backup failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def database_restore_command(source: str, confirmed: bool = False) -> int:
+    path = sqlite_file_path(database_url())
+    if path is None:
+        print("Restore supports SQLite databases only.", file=sys.stderr)
+        return 1
+    if not confirmed and input("This replaces the live DRO database. Type RESTORE to continue: ") != "RESTORE":
+        print("Restore cancelled.", file=sys.stderr)
+        return 1
+    try:
+        restore_database(Path(source), path, confirmed=True)
+        print("Restore completed. Restart DRO to reopen the database.")
+        return 0
+    except (OSError, ValueError, PermissionError) as exc:
+        print(f"Restore failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def retention_cleanup_command() -> int:
+    database = Database()
+    try:
+        with database.session() as session:
+            result = cleanup_retention(session)
+        print(json.dumps(result))
+        return 0
+    finally:
+        database.close()
+
+
 def main() -> int:
     logging.basicConfig(level=logging.DEBUG if os.getenv("DRO_DEBUG") else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -82,6 +126,14 @@ def main() -> int:
     discover = adguard_commands.add_parser("discover", help="discover local AdGuard endpoints on demand")
     discover.add_argument("--subnet", help="manually scan a local IPv4/IPv6 subnet, e.g. 192.168.1.0/24")
     adguard_commands.add_parser("check", help="test configured/detected AdGuard connection (read-only)")
+    db = commands.add_parser("db", help="SQLite maintenance")
+    db_commands = db.add_subparsers(dest="db_command", required=True)
+    backup = db_commands.add_parser("backup", help="create a consistent SQLite backup")
+    backup.add_argument("destination")
+    restore = db_commands.add_parser("restore", help="validate and restore a SQLite backup")
+    restore.add_argument("source")
+    restore.add_argument("--yes", action="store_true", help="confirm replacement of the live database")
+    commands.add_parser("cleanup", help="apply benchmark retention policy")
     args = parser.parse_args()
     if args.command == "benchmark":
         return benchmark_command(args.hostname)
@@ -92,6 +144,12 @@ def main() -> int:
         return 0 if endpoints else 1
     if args.command == "adguard" and args.adguard_command == "check":
         return adguard_check_command()
+    if args.command == "db" and args.db_command == "backup":
+        return database_backup_command(args.destination)
+    if args.command == "db" and args.db_command == "restore":
+        return database_restore_command(args.source, args.yes)
+    if args.command == "cleanup":
+        return retention_cleanup_command()
     return 2
 
 

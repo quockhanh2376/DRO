@@ -1,0 +1,31 @@
+[Unit]
+Description=DRO DNS Route Optimizer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dro
+Group=dro
+WorkingDirectory=/opt/dro
+EnvironmentFile=/etc/dro/dro.env
+Environment=DRO_DATABASE_URL=sqlite:////var/lib/dro/dro.db
+ExecStartPre=/opt/dro/.venv/bin/alembic -c /opt/dro/alembic.ini upgrade head
+ExecStart=/opt/dro/.venv/bin/uvicorn app.api.application:app --host 127.0.0.1 --port 8000 --no-access-log
+Restart=on-failure
+RestartSec=5s
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dro /var/log/dro
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=append:/var/log/dro/dro.log
+SyslogIdentifier=dro
+
+[Install]
+WantedBy=multi-user.target

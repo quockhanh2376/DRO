@@ -22,3 +22,17 @@
 - Added target CRUD, read-only manual benchmark, benchmark/run history, rewrite history, and current rewrite lookup.
 - Extracted the shared read-only benchmark cycle for CLI/API reuse; routes contain no decision logic and no DNS mutation.
 - Added TestClient coverage with temporary SQLite. Web UI and authentication remain out of scope.
+
+## 2026-09-26 — Phase 4 Web UI
+
+- Added the Jinja2/HTMX dashboard, target management, target detail, history, and safe settings pages.
+- Added responsive dark styling and UI tests for rendering, target forms, validation, and secret redaction.
+- Reused existing target, benchmark, and history services. DNS apply and lock controls were deferred until Phase 5.
+
+## 2026-09-26 — Phase 5 Production hardening
+
+- Added a single local admin credential using a persisted scrypt hash, signed HttpOnly/SameSite sessions, optional Secure cookies, and CSRF checks on every mutation.
+- Added audited manual IP lock/unlock, confirmed rollback, immediate post-change health checks with automatic restore, and a default cap of four automatic rewrites per day.
+- Added a persisted, toggleable single-process scheduler with per-target intervals and duplicate-run prevention; added 30-day sample and 180-day benchmark-run cleanup while retaining rewrite history.
+- Added validated SQLite backup/restore CLI commands and safe Ubuntu systemd/installer files using a dedicated `dro` account.
+- Updated production setup, secrets, backup/restore, retention, and scheduler documentation. No DNS was changed during implementation or tests.

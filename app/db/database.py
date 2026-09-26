@@ -57,8 +57,9 @@ class Database:
         """Yield a transactional session, committing on success and rolling back on error."""
         with self.session_factory() as session:
             try:
-                with session.begin():
-                    yield session
+                yield session
+                if session.in_transaction():
+                    session.commit()
             except Exception:
                 session.rollback()
                 raise

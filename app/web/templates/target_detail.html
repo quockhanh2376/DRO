@@ -6,6 +6,10 @@
 <article class="card"><span>Pending winner</span><strong>{{ state.pending_candidate_ip if state and state.pending_candidate_ip else "None" }}</strong><small>{{ state.consecutive_wins if state else 0 }}/{{ target.required_consecutive_wins }} consecutive wins</small></article>
 <article class="card"><span>Mode / status</span><strong>{{ target.mode }} · {{ "Enabled" if target.enabled else "Disabled" }}</strong></article>
 </section>
+<section class="panel"><h2>Rewrite controls</h2><p>Manual lock: <strong>{{ target.manual_lock_ip or "None" }}</strong></p>
+{% if target.manual_lock_ip %}<form method="post" action="/targets/{{ target.id }}/unlock"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button" type="submit">Unlock IP</button></form>
+{% else %}<form method="post" action="/targets/{{ target.id }}/lock" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>Lock IP (blank locks current)<input name="ip" placeholder="Optional IPv4"></label><button class="button" type="submit">Lock IP</button></form>{% endif %}
+{% if rewrite_history %}<form method="post" action="/targets/{{ target.id }}/rollback" onsubmit="return confirm('Roll back the latest DNS rewrite?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="confirm" value="true"><button class="button danger" type="submit">Rollback latest rewrite</button></form>{% endif %}</section>
 <section class="panel"><h2>Latest benchmark</h2>{% if latest %}<p class="muted">{{ latest.completed_at }} · decision <span class="status">{{ latest.decision_action or "—" }}</span> · {{ latest.decision_reason or "" }}</p>
 <h3>Public candidates</h3><p class="ip-list">{% for ip in latest.summary.get('public_ips', []) %}<code>{{ ip }}</code>{% else %}<span class="muted">No public candidate metadata.</span>{% endfor %}</p>
 <div class="table-wrap"><table><thead><tr><th>IP</th><th>Healthy</th><th>Valid runs</th><th>Avg</th><th>Median</th><th>Min</th><th>Max</th><th>Jitter</th></tr></thead><tbody>

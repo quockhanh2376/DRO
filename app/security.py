@@ -21,7 +21,8 @@ def load_secret_environment(path: Path = SECRET_ENV_FILE) -> None:
     """Load KEY=VALUE entries without overriding process environment settings."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
+        # systemd reads a root-only EnvironmentFile before dropping privileges.
         return
     for raw_line in lines:
         line = raw_line.strip()

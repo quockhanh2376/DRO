@@ -12,14 +12,20 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.routes import get_session, get_target_or_404
+from app.api.routes import (LockRequest, RollbackRequest, get_target_or_404,
+                            lock_target as api_lock_target, rollback_target as api_rollback_target,
+                            unlock_target as api_unlock_target)
 from app.api.schemas import TargetPatch
-from app.db.models import BenchmarkRunRecord, OptimizerStateRecord, RewriteHistoryRecord
+from app.auth import _csrf_token, protect_mutation, require_admin
+from app.db.models import BenchmarkRunRecord, OptimizerStateRecord, RewriteHistoryRecord, ScheduleStateRecord
+from app.db.dependencies import get_session
 from app.db.repositories import (
     add_audit_event, get_benchmark_run, list_benchmark_runs, list_rewrite_history,
-    list_targets, save_target,
+    get_setting, list_targets, save_target, set_setting,
 )
 from app.models.target import Target
+from app.core.rewrites import apply_automatic_decision
+from app.core.scheduler import RunAlreadyActive, record_target_run, scheduler_enabled, set_scheduler_enabled
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["web"])
@@ -27,12 +33,11 @@ templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templat
 
 
 def _base_context(request: Request, **values):
-    return {"request": request, **values}
+    return {"request": request, "csrf_token": _csrf_token(request), **values}
 
 
 def _dashboard_rows(session: Session) -> list[dict]:
     rows = []
-    now = datetime.now(timezone.utc)
     for target in list_targets(session):
         run = session.scalar(select(BenchmarkRunRecord).where(
             BenchmarkRunRecord.target_id == target.id
@@ -44,6 +49,7 @@ def _dashboard_rows(session: Session) -> list[dict]:
                                        result.jitter_ms if result.jitter_ms is not None else float("inf")),
                    default=None)
         state = session.get(OptimizerStateRecord, target.id)
+        schedule = session.get(ScheduleStateRecord, target.id)
         current = next((item for item in results if state and item.ip == state.current_rewrite_ip), None)
         improvement = None
         if current and best and current.average_ms and best.average_ms is not None:
@@ -55,18 +61,20 @@ def _dashboard_rows(session: Session) -> list[dict]:
         rows.append({"target": target, "state": state, "run": run, "best": best,
                      "current": current, "improvement": improvement,
                      "wins": state.consecutive_wins if state else 0,
-                     "next_run": next_run, "status": "Disabled" if not target.enabled else
+                     "last_run": schedule.last_run_at if schedule else completed,
+                     "next_run": schedule.next_run_at if schedule else next_run,
+                     "status": "Disabled" if not target.enabled else
                      "No benchmark" if not run else "Healthy" if best else "Critical"})
     return rows
 
 
-@router.get("/", response_class=HTMLResponse, name="dashboard")
+@router.get("/", response_class=HTMLResponse, name="dashboard", dependencies=[Depends(require_admin)])
 def dashboard(request: Request, session: Session = Depends(get_session)):
     return templates.TemplateResponse(request, "dashboard.html",
                                       _base_context(request, rows=_dashboard_rows(session)))
 
 
-@router.get("/targets", response_class=HTMLResponse, name="targets_page")
+@router.get("/targets", response_class=HTMLResponse, name="targets_page", dependencies=[Depends(require_admin)])
 def targets_page(request: Request, session: Session = Depends(get_session)):
     return templates.TemplateResponse(request, "targets.html",
                                       _base_context(request, targets=list_targets(session), target=None,
@@ -84,7 +92,8 @@ def _target_form_values(
             "manual_lock_ip": manual_lock_ip or None}
 
 
-@router.post("/targets", response_class=HTMLResponse, name="create_target_page")
+@router.post("/targets", response_class=HTMLResponse, name="create_target_page",
+             dependencies=[Depends(protect_mutation)])
 def create_target_page(
     request: Request, hostname: str = Form(...), enabled: bool = Form(False),
     mode: str = Form("auto"), interval_hours: int = Form(2), runs_per_ip: int = Form(10),
@@ -110,7 +119,8 @@ def create_target_page(
     return RedirectResponse("/targets", status_code=303)
 
 
-@router.get("/targets/{target_id}/edit", response_class=HTMLResponse, name="edit_target_page")
+@router.get("/targets/{target_id}/edit", response_class=HTMLResponse, name="edit_target_page",
+            dependencies=[Depends(require_admin)])
 def edit_target_page(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
     return templates.TemplateResponse(request, "targets.html",
@@ -118,7 +128,8 @@ def edit_target_page(target_id: int, request: Request, session: Session = Depend
                                                     errors=None))
 
 
-@router.post("/targets/{target_id}/edit", response_class=HTMLResponse, name="update_target_page")
+@router.post("/targets/{target_id}/edit", response_class=HTMLResponse, name="update_target_page",
+             dependencies=[Depends(protect_mutation)])
 def update_target_page(
     target_id: int, request: Request, hostname: str = Form(...), enabled: bool = Form(False),
     mode: str = Form("auto"), interval_hours: int = Form(2), runs_per_ip: int = Form(10),
@@ -126,6 +137,7 @@ def update_target_page(
     manual_lock_ip: str = Form(""), session: Session = Depends(get_session),
 ):
     record = get_target_or_404(session, target_id)
+    old_lock = record.manual_lock_ip
     try:
         values = _target_form_values(hostname, enabled, mode, interval_hours, runs_per_ip,
                                      switch_threshold_ms, switch_threshold_percent, manual_lock_ip)
@@ -135,6 +147,9 @@ def update_target_page(
         if any(item.id != target_id and item.hostname == updated.hostname for item in list_targets(session)):
             raise ValueError("A target with this hostname already exists")
         save_target(session, updated, record)
+        if old_lock != record.manual_lock_ip:
+            add_audit_event(session, "ip_locked" if record.manual_lock_ip else "ip_unlocked",
+                            record.id, {"old_ip": old_lock, "ip": record.manual_lock_ip})
         add_audit_event(session, "target_updated", record.id, {"hostname": record.hostname})
     except (ValueError, TypeError) as exc:
         logger.info("Target update rejected target_id=%d", target_id)
@@ -145,8 +160,12 @@ def update_target_page(
     return RedirectResponse("/targets", status_code=303)
 
 
-@router.post("/targets/{target_id}/delete", name="delete_target_page")
-def delete_target_page(target_id: int, session: Session = Depends(get_session)):
+@router.post("/targets/{target_id}/delete", name="delete_target_page",
+             dependencies=[Depends(protect_mutation)])
+def delete_target_page(target_id: int, confirm: bool = Form(False),
+                       session: Session = Depends(get_session)):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Explicit delete confirmation is required")
     record = get_target_or_404(session, target_id)
     hostname = record.hostname
     session.delete(record)
@@ -155,7 +174,8 @@ def delete_target_page(target_id: int, session: Session = Depends(get_session)):
     return RedirectResponse("/targets", status_code=303)
 
 
-@router.get("/targets/{target_id}", response_class=HTMLResponse, name="target_detail")
+@router.get("/targets/{target_id}", response_class=HTMLResponse, name="target_detail",
+            dependencies=[Depends(require_admin)])
 def target_detail(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
     runs = list_benchmark_runs(session, target_id)
@@ -167,11 +187,19 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
         runs=runs, rewrite_history=list_rewrite_history(session, target_id)))
 
 
-@router.post("/targets/{target_id}/run", name="run_target_now")
+@router.post("/targets/{target_id}/run", name="run_target_now",
+             dependencies=[Depends(protect_mutation)])
 def run_target_now(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
     try:
-        request.app.state.benchmark_cycle(session, target)
+        with request.app.state.run_coordinator.run(target_id):
+            output = request.app.state.benchmark_cycle(session, target)
+            session.commit()
+            record_target_run(session, target)
+            session.commit()
+            apply_automatic_decision(session, target, output)
+    except RunAlreadyActive as exc:
+        raise HTTPException(status_code=409, detail="A benchmark is already running for this target") from exc
     except Exception as exc:
         logger.warning("Manual benchmark failed target_id=%d error=%s", target_id, type(exc).__name__)
         raise HTTPException(status_code=502, detail="Benchmark could not be completed") from exc
@@ -179,7 +207,30 @@ def run_target_now(target_id: int, request: Request, session: Session = Depends(
     return RedirectResponse(f"/targets/{target_id}", status_code=303)
 
 
-@router.get("/history", response_class=HTMLResponse, name="history_page")
+@router.post("/targets/{target_id}/lock", name="lock_target_page",
+             dependencies=[Depends(protect_mutation)])
+def lock_target_page(target_id: int, ip: str = Form(""), session: Session = Depends(get_session)):
+    api_lock_target(target_id, LockRequest(ip=ip or None), session)
+    return RedirectResponse(f"/targets/{target_id}", status_code=303)
+
+
+@router.post("/targets/{target_id}/unlock", name="unlock_target_page",
+             dependencies=[Depends(protect_mutation)])
+def unlock_target_page(target_id: int, session: Session = Depends(get_session)):
+    api_unlock_target(target_id, session)
+    return RedirectResponse(f"/targets/{target_id}", status_code=303)
+
+
+@router.post("/targets/{target_id}/rollback", name="rollback_target_page",
+             dependencies=[Depends(protect_mutation)])
+def rollback_target_page(target_id: int, confirm: bool = Form(False),
+                         session: Session = Depends(get_session)):
+    api_rollback_target(target_id, RollbackRequest(confirm=confirm), session)
+    return RedirectResponse(f"/targets/{target_id}", status_code=303)
+
+
+@router.get("/history", response_class=HTMLResponse, name="history_page",
+            dependencies=[Depends(require_admin)])
 def history_page(request: Request, session: Session = Depends(get_session)):
     targets = {target.id: target for target in list_targets(session)}
     runs = list(session.scalars(select(BenchmarkRunRecord).order_by(
@@ -190,12 +241,32 @@ def history_page(request: Request, session: Session = Depends(get_session)):
         request, targets=targets, runs=runs, rewrites=rewrites))
 
 
-@router.get("/settings", response_class=HTMLResponse, name="settings_page")
-def settings_page(request: Request):
+@router.get("/settings", response_class=HTMLResponse, name="settings_page",
+            dependencies=[Depends(require_admin)])
+def settings_page(request: Request, session: Session = Depends(get_session),
+                  _auth=Depends(require_admin)):
     import os
     from app.security import safe_endpoint
 
     return templates.TemplateResponse(request, "settings.html", _base_context(
         request, adguard_url=safe_endpoint(os.getenv("ADGUARD_URL") or "Not configured"),
-        scheduler_enabled=False, default_interval=2, threshold_ms=50,
-        threshold_percent=5, log_retention_days=7))
+        scheduler_enabled=scheduler_enabled(session), default_interval=2, threshold_ms=50,
+        threshold_percent=5, max_auto_changes=int(get_setting(session, "max_auto_changes_per_day") or "4"),
+        log_retention_days=7))
+
+
+@router.post("/settings/scheduler", name="scheduler_setting",
+             dependencies=[Depends(protect_mutation)])
+def scheduler_setting(enabled: bool = Form(False), session: Session = Depends(get_session)):
+    set_scheduler_enabled(session, enabled)
+    return RedirectResponse("/settings", status_code=303)
+
+
+@router.post("/settings/change-limit", name="change_limit_setting",
+             dependencies=[Depends(protect_mutation)])
+def change_limit_setting(max_auto_changes_per_day: int = Form(4),
+                         session: Session = Depends(get_session)):
+    if not 0 <= max_auto_changes_per_day <= 1000:
+        raise HTTPException(status_code=422, detail="Change limit must be between 0 and 1000")
+    set_setting(session, "max_auto_changes_per_day", str(max_auto_changes_per_day))
+    return RedirectResponse("/settings", status_code=303)
