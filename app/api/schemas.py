@@ -20,7 +20,7 @@ class TargetPatch(BaseModel):
     port: int | None = None
     path: str | None = None
     mode: str | None = None
-    interval_hours: int | None = None
+    interval_hours: float | None = None
     runs_per_ip: int | None = None
     timeout_seconds: float | None = None
     switch_threshold_ms: float | None = None

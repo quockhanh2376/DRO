@@ -10,6 +10,7 @@ Group=dro
 WorkingDirectory=@DRO_INSTALL_DIR@
 EnvironmentFile=@DRO_ENV_FILE@
 Environment=DRO_DATABASE_URL=@DRO_DATABASE_URL@
+Environment=DRO_LOG_FILE=@DRO_LOG_FILE@
 ExecStartPre=@DRO_INSTALL_DIR@/.venv/bin/alembic -c @DRO_INSTALL_DIR@/alembic.ini upgrade head
 ExecStart=@DRO_INSTALL_DIR@/.venv/bin/uvicorn app.api.application:app --host 127.0.0.1 --port @DRO_LISTEN_PORT@ --no-access-log
 Restart=on-failure

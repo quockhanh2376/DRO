@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,8 +16,9 @@ from app.db.database import Database
 from app.db.models import (AdminCredentialRecord, AuditLogRecord, Base, BenchmarkRunRecord,
                            BenchmarkResultRecord, BenchmarkSampleRecord, OptimizerStateRecord,
                            RewriteHistoryRecord, ScheduleStateRecord, TargetRecord)
-from app.db.repositories import add_rewrite_history, save_benchmark_run, save_optimizer_state, save_target, set_setting
-from app.db.retention import cleanup_retention
+from app.db.repositories import (add_rewrite_history, get_setting, save_benchmark_run,
+                                 save_optimizer_state, save_target, set_setting)
+from app.db.retention import cleanup_retention, cleanup_rotated_logs
 from app.maintenance import backup_database, restore_database, validate_database
 from app.models.benchmark import BenchmarkResult, DecisionResult, PendingCandidateState
 from app.models.target import Target
@@ -66,7 +68,12 @@ def test_unauthenticated_and_missing_csrf_mutations_are_rejected(tmp_path, monke
     db = Database(f"sqlite:///{(tmp_path / 'csrf.db').as_posix()}")
     Base.metadata.create_all(db.engine)
     with TestClient(create_app(database=db)) as client:
+        page_response = client.get("/", follow_redirects=False)
+        assert page_response.status_code == 303
+        assert page_response.headers["location"] == "/login"
+        assert client.get("/login").status_code == 200
         assert client.get("/api/v1/targets").status_code == 401
+        assert client.get("/api/v1/targets").json() == {"detail": "Authentication required"}
         assert client.post("/api/v1/targets", json={"hostname": "blocked.example"}).status_code == 401
         page = client.get("/login")
         token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
@@ -215,7 +222,6 @@ def test_scheduler_persists_times_and_guards_duplicate_runs(tmp_path):
     with db.session() as session:
         target = save_target(session, Target(hostname="scheduled.example", interval_hours=3))
         target_id = target.id
-        set_scheduler_enabled(session, True)
     coordinator = RunCoordinator()
     with coordinator.run(target_id), pytest.raises(RunAlreadyActive):
         with coordinator.run(target_id):
@@ -224,6 +230,12 @@ def test_scheduler_persists_times_and_guards_duplicate_runs(tmp_path):
     def cycle(_session, _target):
         runs.append(1)
         return {"decision": {"action": "KEEP"}}
+    assert run_due(db, cycle, coordinator) == 0
+    assert runs == []
+    with db.session() as session:
+        set_scheduler_enabled(session, True)
+    with db.session() as session:
+        assert get_setting(session, "scheduler_enabled") == "true"
     assert run_due(db, cycle, coordinator) == 1
     assert run_due(db, cycle, coordinator) == 0
     assert len(runs) == 1
@@ -231,6 +243,21 @@ def test_scheduler_persists_times_and_guards_duplicate_runs(tmp_path):
         state = session.get(ScheduleStateRecord, target_id)
         assert state and state.last_run_at and state.next_run_at - state.last_run_at == timedelta(hours=3)
     db.close()
+
+
+def test_log_retention_removes_only_old_rotated_files(tmp_path):
+    now = datetime.now(timezone.utc)
+    active = tmp_path / "dro.log"
+    old_log = tmp_path / "dro.log.2.gz"
+    recent_log = tmp_path / "dro.log.1"
+    for path in (active, old_log, recent_log):
+        path.write_text("log")
+    os.utime(old_log, (now.timestamp() - 2 * 86400,) * 2)
+    os.utime(recent_log, (now.timestamp() - 12 * 3600,) * 2)
+    assert cleanup_rotated_logs(active, 1, now) == 1
+    assert active.exists() and recent_log.exists() and not old_log.exists()
+    with pytest.raises(ValueError):
+        cleanup_rotated_logs(active, 0, now)
 
 
 def test_retention_deletes_samples_and_old_runs_but_keeps_rewrite_history(tmp_path):

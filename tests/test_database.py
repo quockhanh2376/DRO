@@ -110,6 +110,9 @@ def test_initial_alembic_upgrade_downgrade_upgrade(tmp_path, monkeypatch):
     indexes = {index["name"] for table in ("benchmark_runs", "rewrite_history")
                for index in inspect(engine_db.engine).get_indexes(table)}
     assert {"ix_benchmark_runs_target_completed", "ix_rewrite_history_target_created"} <= indexes
+    interval_type = next(column["type"] for column in inspect(engine_db.engine).get_columns("targets")
+                         if column["name"] == "interval_hours")
+    assert "FLOAT" in str(interval_type).upper()
     engine_db.close()
     command.downgrade(config, "base")
     engine_db = Database(f"sqlite:///{path.as_posix()}")

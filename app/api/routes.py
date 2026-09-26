@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from ipaddress import IPv4Address
 from pydantic import BaseModel, Field, ValidationError
@@ -11,11 +13,10 @@ from sqlalchemy.orm import Session
 
 from app.core.optimizer import read_adguard_rewrite, run_benchmark_cycle
 from app.core.rewrites import apply_automatic_decision, set_rewrite
-from app.core.scheduler import RunAlreadyActive, record_target_run, scheduler_enabled, set_scheduler_enabled
+from app.core.scheduler import (RunAlreadyActive, default_interval_hours, record_target_run,
+                                scheduler_enabled, set_scheduler_enabled)
 from app.db.dependencies import get_session
-from app.db.models import (
-    RewriteHistoryRecord, TargetRecord,
-)
+from app.db.models import RewriteHistoryRecord, ScheduleStateRecord, TargetRecord
 from app.db.repositories import (
     add_audit_event, count_benchmark_runs, count_targets, delete_target as repo_delete_target, get_benchmark_run,
     get_current_rewrite_ip, get_target, get_target_by_id, list_benchmark_runs,
@@ -87,6 +88,8 @@ def list_targets(session: Session = Depends(get_session)) -> list[TargetRead]:
 @router.post("/api/v1/targets", response_model=TargetRead, status_code=201,
              dependencies=[Depends(protect_mutation)])
 def create_target(body: TargetCreate, session: Session = Depends(get_session)) -> TargetRead:
+    if "interval_hours" not in body.model_fields_set:
+        body = body.model_copy(update={"interval_hours": default_interval_hours(session)})
     if get_target(session, body.hostname):
         raise HTTPException(status_code=409, detail="Target already exists")
     try:
@@ -113,6 +116,9 @@ def patch_target(target_id: int, body: TargetPatch, session: Session = Depends(g
     try:
         old_lock = record.manual_lock_ip
         saved = save_target(session, updated, record=record)
+        schedule = session.get(ScheduleStateRecord, target_id)
+        if schedule and schedule.last_run_at and "interval_hours" in body.model_fields_set:
+            schedule.next_run_at = schedule.last_run_at + timedelta(hours=saved.interval_hours)
         if old_lock != saved.manual_lock_ip:
             add_audit_event(session, "ip_locked" if saved.manual_lock_ip else "ip_unlocked", target_id,
                             {"old_ip": old_lock, "ip": saved.manual_lock_ip})

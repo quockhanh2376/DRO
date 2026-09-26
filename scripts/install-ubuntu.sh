@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SOURCE_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+source "$SOURCE_DIR/scripts/python-version.sh"
 DEST_DIR="${DRO_INSTALL_DIR:-/opt/dro}"
 SERVICE_NAME="${DRO_SERVICE_NAME:-dro}"
 DATABASE_PATH="${DRO_DATABASE_PATH:-/var/lib/dro/dro.db}"
@@ -9,7 +10,7 @@ LOG_FILE="${DRO_LOG_FILE:-/var/log/dro/dro.log}"
 LOGROTATE_NAME="${DRO_LOGROTATE_NAME:-dro}"
 LISTEN_PORT="${DRO_LISTEN_PORT:-8000}"
 ENV_FILE="${DRO_ENV_FILE:-/etc/dro/dro.env}"
-PYTHON="${DRO_PYTHON:-python3.12}"
+PYTHON="${DRO_PYTHON:-python3}"
 DATABASE_URL="sqlite:////${DATABASE_PATH#/}"
 
 path_is_within() {
@@ -33,7 +34,7 @@ path_is_within "$DEST_DIR" /opt/dro || { echo "DRO_INSTALL_DIR resolves outside 
 path_is_within "$DATABASE_PATH" /var/lib/dro || { echo "DRO_DATABASE_PATH resolves outside /var/lib/dro." >&2; exit 1; }
 path_is_within "$LOG_FILE" /var/log/dro || { echo "DRO_LOG_FILE resolves outside /var/log/dro." >&2; exit 1; }
 path_is_within "$ENV_FILE" /etc/dro && [[ "$(realpath -m -- "$ENV_FILE")" != /etc/dro ]] || { echo "DRO_ENV_FILE must resolve to a file under /etc/dro." >&2; exit 1; }
-"$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' || { echo "Python 3.12 or newer is required." >&2; exit 1; }
+python_version_supported "$PYTHON" || { echo "Python 3.12 or newer is required." >&2; exit 1; }
 
 getent group dro >/dev/null || groupadd --system dro
 id -u dro >/dev/null 2>&1 || useradd --system --gid dro --home-dir /var/lib/dro --shell /usr/sbin/nologin dro

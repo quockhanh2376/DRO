@@ -26,7 +26,7 @@ class TargetRecord(Base):
     port: Mapped[int] = mapped_column(Integer, default=443)
     path: Mapped[str] = mapped_column(String(2048), default="/")
     mode: Mapped[str] = mapped_column(String(20), default="auto")
-    interval_hours: Mapped[int] = mapped_column(Integer, default=2)
+    interval_hours: Mapped[float] = mapped_column(Float, default=2)
     runs_per_ip: Mapped[int] = mapped_column(Integer, default=10)
     timeout_seconds: Mapped[float] = mapped_column(Float, default=10.0)
     switch_threshold_ms: Mapped[float] = mapped_column(Float, default=50.0)

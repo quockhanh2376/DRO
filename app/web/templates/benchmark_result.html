@@ -1,0 +1,15 @@
+<section class="panel benchmark-result" {% if latest %}data-run-id="{{ latest.id }}"{% endif %}>
+  {% if latest %}
+  <h2>Benchmark result: {{ target.hostname }}</h2>
+  <dl class="benchmark-summary">
+    <div><dt>Current rewrite IP</dt><dd>{{ latest.summary.get('current_rewrite_ip') or "Unavailable" }}</dd></div>
+    <div><dt>Discovered candidates</dt><dd class="ip-list">{% for ip in latest.summary.get('candidate_ips', latest.summary.get('public_ips', [])) %}<code>{{ ip }}</code>{% else %}None{% endfor %}</dd></div>
+    <div><dt>Best IP</dt><dd><strong class="best-ip">{{ best.ip if best else "Unavailable" }}</strong></dd></div>
+    <div><dt>Decision</dt><dd><span class="status">{{ latest.decision_action or "—" }}</span> {{ latest.decision_reason or "" }}</dd></div>
+    <div><dt>Run timestamp</dt><dd>{{ latest.completed_at }}</dd></div>
+  </dl>
+  <div class="table-wrap"><table><thead><tr><th>IP</th><th>Avg</th><th>Median</th><th>Min</th><th>Max</th><th>Jitter</th></tr></thead><tbody>
+  {% for result in latest.results %}<tr{% if best and result.ip == best.ip %} class="best-candidate"{% endif %}><td>{{ result.ip }}{% if best and result.ip == best.ip %} <span class="badge">Best</span>{% endif %}</td><td>{{ result.average_ms if result.average_ms is not none else "—" }}</td><td>{{ result.median_ms if result.median_ms is not none else "—" }}</td><td>{{ result.min_ms if result.min_ms is not none else "—" }}</td><td>{{ result.max_ms if result.max_ms is not none else "—" }}</td><td>{{ result.jitter_ms if result.jitter_ms is not none else "—" }}</td></tr>{% else %}<tr><td colspan="6" class="empty">No benchmark results.</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% else %}<h2>Benchmark result: {{ target.hostname }}</h2><p class="empty">The run finished without a saved benchmark result.</p>{% endif %}
+</section>

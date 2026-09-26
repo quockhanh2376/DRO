@@ -90,3 +90,12 @@ def test_manual_run_and_history_are_read_only_views(api):
     assert rewrite == {"target_id": target["id"], "hostname": "history.example",
                        "ip": "1.2.3.4", "source": "database"}
     assert client.get("/api/v1/runs/999").status_code == 404
+
+
+def test_api_manual_run_rejects_concurrent_target_run(api):
+    client, _database = api
+    target = client.post("/api/v1/targets", json={"hostname": "api-busy.example"}).json()
+    with client.app.state.run_coordinator.run(target["id"]):
+        response = client.post(f"/api/v1/targets/{target['id']}/run")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "A benchmark is already running for this target"

@@ -8,7 +8,7 @@
   <input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}">
   <label>Hostname<input name="hostname" required value="{{ f.hostname if f else '' }}" placeholder="service.example.com"></label>
   <label>Mode<select name="mode">{% for mode in ['monitor','recommend','auto'] %}<option value="{{ mode }}" {% if (f.mode if f else 'auto') == mode %}selected{% endif %}>{{ mode }}</option>{% endfor %}</select></label>
-  <label>Interval (hours)<input type="number" name="interval_hours" min="1" required value="{{ f.interval_hours if f else 2 }}"></label>
+  <label>Interval (hours)<input type="number" name="interval_hours" min="0" step="any" required value="{{ f.interval_hours if f else default_interval_hours }}"></label>
   <label>Runs per IP<input type="number" name="runs_per_ip" min="1" required value="{{ f.runs_per_ip if f else 10 }}"></label>
   <label>Switch threshold (ms)<input type="number" step="any" name="switch_threshold_ms" min="0" value="{{ f.switch_threshold_ms if f else 50 }}"></label>
   <label>Switch threshold (%)<input type="number" step="any" name="switch_threshold_percent" min="0" max="100" value="{{ f.switch_threshold_percent if f else 5 }}"></label>
@@ -18,6 +18,7 @@
   <div class="span-2"><button class="button primary" type="submit">{{ "Save target" if target else "Add target" }}</button>{% if target %} <a class="button secondary" href="/targets">Cancel</a>{% endif %}</div>
 </form></section>
 <section class="table-wrap"><table><thead><tr><th>Hostname</th><th>Enabled</th><th>Mode</th><th>Interval</th><th>Runs/IP</th><th>Threshold</th><th></th></tr></thead><tbody>
-{% for item in targets %}<tr><td><a href="/targets/{{ item.id }}">{{ item.hostname }}</a></td><td>{{ "Yes" if item.enabled else "No" }}</td><td>{{ item.mode }}</td><td>{{ item.interval_hours }}h</td><td>{{ item.runs_per_ip }}</td><td>{{ item.switch_threshold_ms }}ms / {{ item.switch_threshold_percent }}%</td><td class="actions"><a href="/targets/{{ item.id }}/edit">Edit</a><form method="post" action="/targets/{{ item.id }}/delete" onsubmit="return confirm('Delete {{ item.hostname }} and its stored history?')"><input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}"><button class="link danger" type="submit">Delete</button></form></td></tr>
+{% for item in targets %}<tr><td><a href="/targets/{{ item.id }}">{{ item.hostname }}</a></td><td>{{ "Yes" if item.enabled else "No" }}</td><td>{{ item.mode }}</td><td>{{ item.interval_hours }}h</td><td>{{ item.runs_per_ip }}</td><td>{{ item.switch_threshold_ms }}ms / {{ item.switch_threshold_percent }}%</td><td class="actions"><a href="/targets/{{ item.id }}/edit">Edit</a><form method="post" action="/targets/{{ item.id }}/run" hx-post="/targets/{{ item.id }}/run" hx-target="#run-result" hx-swap="innerHTML" hx-indicator="find .run-indicator" hx-disabled-elt="find button"><input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}"><button class="button" type="submit">Run Now</button><span class="run-indicator htmx-indicator" role="status">Running benchmark...</span></form><form method="post" action="/targets/{{ item.id }}/delete" onsubmit="return confirm('Delete {{ item.hostname }} and its stored history?')"><input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}"><button class="link danger" type="submit">Delete</button></form></td></tr>
 {% else %}<tr><td colspan="7" class="empty">No targets configured.</td></tr>{% endfor %}</tbody></table></section>
+<div id="run-result" aria-live="polite"></div>
 {% endblock %}

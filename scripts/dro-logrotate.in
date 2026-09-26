@@ -1,6 +1,6 @@
 @DRO_LOG_FILE@ {
     daily
-    rotate 7
+    rotate -1
     missingok
     notifempty
     compress

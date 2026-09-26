@@ -7,7 +7,7 @@ DRO supports HTTPS/Web targets only. It discovers and benchmarks public HTTPS en
 Requires Python 3.12+ and `curl` on `PATH`.
 
 ```sh
-python3.12 -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e ".[dev]"
 alembic upgrade head
@@ -44,6 +44,12 @@ alembic upgrade head
 
 The web pages and API require login except `/login`, `/health`, and `/api/v1/system/status`. All mutation routes require a valid CSRF token. Login initializes the admin hash the first time the configured credentials are used.
 
+## Current Production State (2026-09-27)
+
+DRO is deployed on `172.16.10.9` at `/opt/dro`, with database `/var/lib/dro/dro.db`, secrets in `/etc/dro/dro.env` (`root:root`, mode `600`), service `dro.service`, and HTTP port `18081`. The authenticated UI is at [http://172.16.10.9:18081](http://172.16.10.9:18081); AdGuard Home is at [http://172.16.10.9](http://172.16.10.9), and DRO accesses its API at `http://127.0.0.1`. The deployed database is at Alembic revision `0005_fractional_intervals`. Production currently listens on `0.0.0.0:18081` over HTTP; HTTPS proxying and rebinding Uvicorn to localhost remain planned.
+
+The scheduler is currently disabled; absent saved overrides, the default interval is two hours and log retention is seven days. Per-target intervals continue to govern scheduled runs when enabled. Benchmark samples are retained 30 days, benchmark runs 180 days, and rewrite history indefinitely. The latest deployment includes the HTMX inline Run Now result and editable default interval, scheduler, and log-retention settings. The legacy `dns-optimizer.timer` is disabled, while `/opt/dns-optimizer` remains available for rollback.
+
 ## Ubuntu service installation
 
 Configure `/etc/dro/dro.env`, then run from a repository checkout:
@@ -56,7 +62,7 @@ sudo journalctl -u dro.service
 
 The installer uses a dedicated `dro` account, places the app in `/opt/dro`, data in `/var/lib/dro`, and logs in `/var/log/dro`. It installs `systemd/dro.service`, enables restart-on-failure, and does not access or alter `/opt/dns-optimizer`. Re-running it preserves `/etc/dro/dro.env`. It requires Python 3.12+ and the admin password and session signing secret before starting the service. For a separate validation instance, override `DRO_INSTALL_DIR`, `DRO_SERVICE_NAME`, `DRO_DATABASE_PATH`, `DRO_LOG_FILE`, `DRO_LOGROTATE_NAME`, `DRO_LISTEN_PORT`, and optionally `DRO_PYTHON`; paths are restricted to the corresponding `/opt/dro`, `/var/lib/dro`, and `/var/log/dro` trees.
 
-The service binds to `127.0.0.1:8000`; use an HTTPS reverse proxy for remote access and set `DRO_HTTPS_ENABLED=true`. It runs Alembic migrations before starting. Uvicorn access logging is disabled. Diagnostics go to `/var/log/dro/dro.log`; `scripts/dro-logrotate` retains seven daily logs.
+The installer template binds to `127.0.0.1:8000`; use an HTTPS reverse proxy for remote access and set `DRO_HTTPS_ENABLED=true`. It runs Alembic migrations before starting. Uvicorn access logging is disabled. Diagnostics go to `/var/log/dro/dro.log`; logrotate rotates daily and the application prunes rotated logs according to the saved retention setting (7 days by default).
 
 ## Scheduler, locks, and DNS changes
 

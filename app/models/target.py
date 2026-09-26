@@ -18,7 +18,7 @@ class Target(BaseModel):
     port: int = Field(default=443, ge=1, le=65535)
     path: str = "/"
     mode: Literal["monitor", "recommend", "auto"] = "auto"
-    interval_hours: int = Field(default=2, ge=1)
+    interval_hours: float = Field(default=2, gt=0)
     runs_per_ip: int = Field(default=10, ge=1)
     timeout_seconds: float = Field(default=10.0, gt=0)
     switch_threshold_ms: float = Field(default=50, ge=0)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,8 @@ from app.core.rewrites import apply_automatic_decision
 from app.db.database import Database
 from app.db.models import ScheduleStateRecord, TargetRecord
 from app.db.repositories import add_audit_event, get_setting, set_setting
-from app.db.retention import cleanup_retention
+from app.db.retention import (cleanup_retention, cleanup_rotated_logs,
+                              configured_log_retention_days)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,22 @@ class RunCoordinator:
 
 def scheduler_enabled(session) -> bool:
     return (get_setting(session, "scheduler_enabled") or "false").lower() == "true"
+
+
+def default_interval(session) -> tuple[float, str]:
+    value, unit = get_setting(session, "default_interval_value"), get_setting(session, "default_interval_unit")
+    try:
+        interval = float(value) if value is not None else 2.0
+    except ValueError:
+        interval = 2.0
+    if not math.isfinite(interval) or interval <= 0:
+        interval = 2.0
+    return interval, unit if unit in {"minutes", "hours"} else "hours"
+
+
+def default_interval_hours(session) -> float:
+    value, unit = default_interval(session)
+    return value / 60 if unit == "minutes" else value
 
 
 def set_scheduler_enabled(session, enabled: bool) -> None:
@@ -158,6 +177,10 @@ def cleanup_if_due(database: Database, now: datetime | None = None) -> dict[str,
             except ValueError:
                 pass
         counts = cleanup_retention(session, now)
+        retention_days = configured_log_retention_days(session)
+        log_file = os.getenv("DRO_LOG_FILE")
+        if log_file:
+            counts["logs_deleted"] = cleanup_rotated_logs(log_file, retention_days, now)
         set_setting(session, "retention_last_cleanup", now.isoformat())
     logger.info("Retention cleanup complete samples=%d runs=%d",
                 counts["samples_deleted"], counts["runs_deleted"])

@@ -11,9 +11,10 @@ from pathlib import Path
 
 from app.core.optimizer import run_benchmark_cycle
 from app.db.database import Database, database_url, sqlite_file_path
-from app.db.retention import cleanup_retention
-from app.maintenance import backup_database, restore_database
+from app.db.retention import (cleanup_retention, cleanup_rotated_logs,
+                              configured_log_retention_days)
 from app.db.repositories import get_target, save_target
+from app.maintenance import backup_database, restore_database
 from app.integrations.adguard import AdGuardClient, AdGuardError, discover_adguard
 from app.models.target import Target
 from app.security import load_secret_environment, safe_endpoint
@@ -96,10 +97,15 @@ def database_restore_command(source: str, confirmed: bool = False) -> int:
 
 
 def retention_cleanup_command() -> int:
+    load_secret_environment()
     database = Database()
     try:
         with database.session() as session:
             result = cleanup_retention(session)
+            log_file = os.getenv("DRO_LOG_FILE")
+            if log_file:
+                result["logs_deleted"] = cleanup_rotated_logs(
+                    log_file, configured_log_retention_days(session))
         print(json.dumps(result))
         return 0
     finally:

@@ -20,16 +20,26 @@ from app.auth import _csrf_token, protect_mutation, require_admin
 from app.db.models import BenchmarkRunRecord, OptimizerStateRecord, RewriteHistoryRecord, ScheduleStateRecord
 from app.db.dependencies import get_session
 from app.db.repositories import (
-    add_audit_event, get_benchmark_run, list_benchmark_runs, list_rewrite_history,
-    get_setting, list_targets, save_target, set_setting,
+    add_audit_event, get_benchmark_run, get_setting, list_benchmark_runs, list_rewrite_history,
+    list_targets, save_target, set_setting,
 )
 from app.models.target import Target
-from app.core.rewrites import apply_automatic_decision
-from app.core.scheduler import RunAlreadyActive, record_target_run, scheduler_enabled, set_scheduler_enabled
+from app.core.scheduler import (RunAlreadyActive, default_interval, default_interval_hours,
+                                record_target_run, scheduler_enabled, set_scheduler_enabled)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["web"])
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
+
+
+def _best_benchmark_result(run):
+    if not run:
+        return None
+    return min((item for item in run.results if item.healthy and item.average_ms is not None),
+               key=lambda item: (item.average_ms,
+                                 item.median_ms if item.median_ms is not None else float("inf"),
+                                 item.jitter_ms if item.jitter_ms is not None else float("inf")),
+               default=None)
 
 
 def _base_context(request: Request, **values):
@@ -78,11 +88,12 @@ def dashboard(request: Request, session: Session = Depends(get_session)):
 def targets_page(request: Request, session: Session = Depends(get_session)):
     return templates.TemplateResponse(request, "targets.html",
                                       _base_context(request, targets=list_targets(session), target=None,
-                                                    errors=None))
+                                                    errors=None,
+                                                    default_interval_hours=default_interval_hours(session)))
 
 
 def _target_form_values(
-    hostname: str, enabled: bool, mode: str, interval_hours: int, runs_per_ip: int,
+    hostname: str, enabled: bool, mode: str, interval_hours: float, runs_per_ip: int,
     switch_threshold_ms: float, switch_threshold_percent: float, manual_lock_ip: str | None,
 ) -> dict:
     return {"hostname": hostname, "enabled": enabled, "mode": mode,
@@ -96,10 +107,11 @@ def _target_form_values(
              dependencies=[Depends(protect_mutation)])
 def create_target_page(
     request: Request, hostname: str = Form(...), enabled: bool = Form(False),
-    mode: str = Form("auto"), interval_hours: int = Form(2), runs_per_ip: int = Form(10),
+    mode: str = Form("auto"), interval_hours: float | None = Form(None), runs_per_ip: int = Form(10),
     switch_threshold_ms: float = Form(50), switch_threshold_percent: float = Form(5),
     manual_lock_ip: str = Form(""), session: Session = Depends(get_session),
 ):
+    interval_hours = default_interval_hours(session) if interval_hours is None else interval_hours
     try:
         target = Target.model_validate(_target_form_values(
             hostname, enabled, mode, interval_hours, runs_per_ip,
@@ -113,7 +125,8 @@ def create_target_page(
         return templates.TemplateResponse(request, "targets.html", _base_context(
             request, targets=list_targets(session), target=None, errors=[str(exc)],
             form_values=_target_form_values(hostname, enabled, mode, interval_hours, runs_per_ip,
-                                            switch_threshold_ms, switch_threshold_percent, manual_lock_ip)),
+                                            switch_threshold_ms, switch_threshold_percent, manual_lock_ip),
+            default_interval_hours=default_interval_hours(session)),
             status_code=422)
     logger.info("Target created hostname=%s", record.hostname)
     return RedirectResponse("/targets", status_code=303)
@@ -125,18 +138,20 @@ def edit_target_page(target_id: int, request: Request, session: Session = Depend
     target = get_target_or_404(session, target_id)
     return templates.TemplateResponse(request, "targets.html",
                                       _base_context(request, targets=list_targets(session), target=target,
-                                                    errors=None))
+                                                    errors=None,
+                                                    default_interval_hours=default_interval_hours(session)))
 
 
 @router.post("/targets/{target_id}/edit", response_class=HTMLResponse, name="update_target_page",
              dependencies=[Depends(protect_mutation)])
 def update_target_page(
     target_id: int, request: Request, hostname: str = Form(...), enabled: bool = Form(False),
-    mode: str = Form("auto"), interval_hours: int = Form(2), runs_per_ip: int = Form(10),
+    mode: str = Form("auto"), interval_hours: float | None = Form(None), runs_per_ip: int = Form(10),
     switch_threshold_ms: float = Form(50), switch_threshold_percent: float = Form(5),
     manual_lock_ip: str = Form(""), session: Session = Depends(get_session),
 ):
     record = get_target_or_404(session, target_id)
+    interval_hours = record.interval_hours if interval_hours is None else interval_hours
     old_lock = record.manual_lock_ip
     try:
         values = _target_form_values(hostname, enabled, mode, interval_hours, runs_per_ip,
@@ -150,11 +165,15 @@ def update_target_page(
         if old_lock != record.manual_lock_ip:
             add_audit_event(session, "ip_locked" if record.manual_lock_ip else "ip_unlocked",
                             record.id, {"old_ip": old_lock, "ip": record.manual_lock_ip})
+        schedule = session.get(ScheduleStateRecord, record.id)
+        if schedule and schedule.last_run_at:
+            schedule.next_run_at = schedule.last_run_at + timedelta(hours=updated.interval_hours)
         add_audit_event(session, "target_updated", record.id, {"hostname": record.hostname})
     except (ValueError, TypeError) as exc:
         logger.info("Target update rejected target_id=%d", target_id)
         return templates.TemplateResponse(request, "targets.html", _base_context(
-            request, targets=list_targets(session), target=record, errors=[str(exc)], form_values=values),
+            request, targets=list_targets(session), target=record, errors=[str(exc)], form_values=values,
+            default_interval_hours=default_interval_hours(session)),
             status_code=422)
     logger.info("Target updated target_id=%d hostname=%s", target_id, record.hostname)
     return RedirectResponse("/targets", status_code=303)
@@ -182,8 +201,9 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
     latest = get_benchmark_run(session, runs[0].id) if runs else None
     state = session.get(OptimizerStateRecord, target_id)
     current = next((item for item in latest.results if state and item.ip == state.current_rewrite_ip), None) if latest else None
+    best = _best_benchmark_result(latest)
     return templates.TemplateResponse(request, "target_detail.html", _base_context(
-        request, target=target, latest=latest, state=state, current=current,
+        request, target=target, latest=latest, state=state, current=current, best=best,
         runs=runs, rewrite_history=list_rewrite_history(session, target_id)))
 
 
@@ -197,13 +217,20 @@ def run_target_now(target_id: int, request: Request, session: Session = Depends(
             session.commit()
             record_target_run(session, target)
             session.commit()
-            apply_automatic_decision(session, target, output)
     except RunAlreadyActive as exc:
         raise HTTPException(status_code=409, detail="A benchmark is already running for this target") from exc
     except Exception as exc:
         logger.warning("Manual benchmark failed target_id=%d error=%s", target_id, type(exc).__name__)
         raise HTTPException(status_code=502, detail="Benchmark could not be completed") from exc
     logger.info("Manual benchmark completed target_id=%d hostname=%s", target_id, target.hostname)
+    if request.headers.get("HX-Request", "").lower() == "true":
+        run_id = output.get("benchmark_run_id") if isinstance(output, dict) else None
+        latest = get_benchmark_run(session, run_id) if run_id else None
+        if latest is None:
+            runs = list_benchmark_runs(session, target_id)
+            latest = get_benchmark_run(session, runs[0].id) if runs else None
+        return templates.TemplateResponse(request, "benchmark_result.html", _base_context(
+            request, target=target, latest=latest, best=_best_benchmark_result(latest)))
     return RedirectResponse(f"/targets/{target_id}", status_code=303)
 
 
@@ -245,14 +272,64 @@ def history_page(request: Request, session: Session = Depends(get_session)):
             dependencies=[Depends(require_admin)])
 def settings_page(request: Request, session: Session = Depends(get_session),
                   _auth=Depends(require_admin)):
+    return _settings_response(request, session)
+
+
+def _settings_response(request: Request, session: Session, errors=None,
+                       interval_value: str | None = None, interval_unit: str | None = None,
+                       retention_value: str | None = None, status_code: int = 200):
     import os
     from app.security import safe_endpoint
 
+    value, unit = default_interval(session)
+    try:
+        log_retention_days = max(1, int(get_setting(session, "log_retention_days") or "7"))
+    except ValueError:
+        log_retention_days = 7
     return templates.TemplateResponse(request, "settings.html", _base_context(
         request, adguard_url=safe_endpoint(os.getenv("ADGUARD_URL") or "Not configured"),
-        scheduler_enabled=scheduler_enabled(session), default_interval=2, threshold_ms=50,
-        threshold_percent=5, max_auto_changes=int(get_setting(session, "max_auto_changes_per_day") or "4"),
-        log_retention_days=7))
+        scheduler_enabled=scheduler_enabled(session),
+        default_interval_value=interval_value if interval_value is not None else value,
+        default_interval_unit=interval_unit if interval_unit is not None else unit,
+        threshold_ms=50, threshold_percent=5,
+        max_auto_changes=int(get_setting(session, "max_auto_changes_per_day") or "4"),
+        log_retention_days=retention_value if retention_value is not None else log_retention_days,
+        errors=errors), status_code=status_code)
+
+
+@router.post("/settings/default-interval", name="default_interval_setting",
+             dependencies=[Depends(protect_mutation)])
+def default_interval_setting(request: Request, value: str = Form(...), unit: str = Form(...),
+                             session: Session = Depends(get_session)):
+    import math
+
+    try:
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed <= 0 or unit not in {"minutes", "hours"}:
+            raise ValueError
+    except ValueError:
+        return _settings_response(request, session, {"default_interval": "Enter a positive interval and choose minutes or hours."},
+                                  value, unit, status_code=422)
+    set_setting(session, "default_interval_value", str(parsed))
+    set_setting(session, "default_interval_unit", unit)
+    add_audit_event(session, "default_interval_updated", details={"value": parsed, "unit": unit})
+    return RedirectResponse("/settings", status_code=303)
+
+
+@router.post("/settings/log-retention", name="log_retention_setting",
+             dependencies=[Depends(protect_mutation)])
+def log_retention_setting(request: Request, days: str = Form(...),
+                          session: Session = Depends(get_session)):
+    try:
+        value = int(days)
+        if value < 1:
+            raise ValueError
+    except ValueError:
+        return _settings_response(request, session, {"log_retention": "Log retention must be at least 1 day."},
+                                  retention_value=days, status_code=422)
+    set_setting(session, "log_retention_days", str(value))
+    add_audit_event(session, "log_retention_updated", details={"days": value})
+    return RedirectResponse("/settings", status_code=303)
 
 
 @router.post("/settings/scheduler", name="scheduler_setting",

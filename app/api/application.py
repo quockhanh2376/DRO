@@ -9,10 +9,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.core.optimizer import run_benchmark_cycle
@@ -57,6 +59,12 @@ def create_app(database: Database | None = None, benchmark_cycle=run_benchmark_c
     from app.web.routes import router as web_router
     application.include_router(auth_router)
     application.include_router(web_router)
+
+    @application.exception_handler(StarletteHTTPException)
+    async def authentication_redirect(request: Request, exc: StarletteHTTPException):
+        if exc.status_code == 401 and not request.url.path.startswith("/api/"):
+            return RedirectResponse("/login", status_code=303)
+        return await http_exception_handler(request, exc)
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(_request: Request, _exc: RequestValidationError) -> JSONResponse:
