@@ -19,7 +19,7 @@ python -m pytest
 
 ## Ubuntu live validation (read-only)
 
-From the repository on Ubuntu:
+From the repository on Ubuntu (Python 3.12+):
 
 ```sh
 python3.12 -m venv .venv
@@ -30,21 +30,25 @@ sudo install -o root -g root -m 600 /dev/null /etc/dro/dro.env
 sudoedit /etc/dro/dro.env
 sudo chown root:root /etc/dro/dro.env
 sudo chmod 600 /etc/dro/dro.env
-dro adguard check
+sudo install -d -o root -g root -m 750 /var/lib/dro
+sudo .venv/bin/alembic -c alembic.ini upgrade head
+sudo .venv/bin/dro adguard check
 ```
+
+Run the commands from the repository root under an account that can read `/etc/dro/dro.env` (the example uses root because the file is root-only). The service database defaults to `/var/lib/dro/dro.db` on Linux. For local development set `DRO_DB_PATH=data/dev.db`, or set `DRO_DATABASE_URL` to a SQLAlchemy URL. Database credentials are never configured in SQLite; AdGuard secrets remain in `/etc/dro/dro.env`.
 
 If no configured or localhost instance is detected, subnet discovery is manual and on-demand:
 
 ```sh
-dro adguard discover --subnet 192.168.1.0/24
+sudo .venv/bin/dro adguard discover --subnet 192.168.1.0/24
 ```
 
 If several choices are returned, set the selected endpoint in `/etc/dro/dro.env` and rerun the check. Then benchmark any hostname:
 
 ```sh
-dro benchmark go.fyi.app
-dro benchmark app.practicemanager.xero.com
-dro benchmark example.com
+sudo .venv/bin/dro benchmark go.fyi.app
+sudo .venv/bin/dro benchmark app.practicemanager.xero.com
+sudo .venv/bin/dro benchmark example.com
 ```
 
 `dro adguard check` performs only a rewrite-list read. `dro benchmark` reads the current rewrite when AdGuard is available, adds its IP to public DNS candidates, benchmarks the candidates, and prints a decision. Both commands are read-only and never apply a DNS change.

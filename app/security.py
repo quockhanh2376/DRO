@@ -12,6 +12,9 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*)(?:basic|bearer)?\s*[^\s,;]+"),
     re.compile(r"(?i)((?:password|passwd|token|secret|api[_-]?key)\s*[:=]\s*)[^\s,;]+"),
 )
+_SECRET_KEYS = re.compile(
+    r"(?i)(?:^|[_.-])(?:password|passwd|pass|secret|token|authorization|api[_-]?key)(?:$|[_.-])"
+)
 
 
 def load_secret_environment(path: Path = SECRET_ENV_FILE) -> None:
@@ -49,3 +52,23 @@ def safe_endpoint(value: str) -> str:
     if parts.port:
         host = f"{host}:{parts.port}"
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def sanitize_for_storage(value):
+    """Remove credential fields and redact credential-like values before persistence."""
+    if isinstance(value, dict):
+        return {key: sanitize_for_storage(item) for key, item in value.items()
+                if not _SECRET_KEYS.search(str(key))}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_for_storage(item) for item in value]
+    if isinstance(value, str):
+        text = redact_secrets(value)
+        for key, secret in os.environ.items():
+            if _SECRET_KEYS.search(key) and secret and len(secret) >= 3:
+                text = text.replace(secret, "[REDACTED]")
+        return text
+    return value
+
+
+def is_secret_key(value: str) -> bool:
+    return bool(_SECRET_KEYS.search(value))

@@ -16,6 +16,9 @@ from app.models.target import Target
 from app.core import benchmark as benchmark_module
 from app import main as main_module
 from app.security import load_secret_environment, redact_secrets
+from app.db.database import Database
+from app.db.models import Base
+from app.db.repositories import get_pending_state
 
 
 def result(ip: str, avg: float, healthy: bool = True, median: float | None = None, jitter: float = 1) -> BenchmarkResult:
@@ -199,7 +202,7 @@ def test_other_windows_tls_failures_do_not_retry(monkeypatch):
     assert "--ssl-no-revoke" not in calls[0]
 
 
-def test_cli_includes_current_rewrite_and_decides(monkeypatch, capsys):
+def test_cli_includes_current_rewrite_and_decides(monkeypatch, capsys, tmp_path):
     class FakeAdGuard:
         def __init__(self, base_url=None):
             pass
@@ -213,18 +216,36 @@ def test_cli_includes_current_rewrite_and_decides(monkeypatch, capsys):
         def close(self):
             pass
     class FakeRunner:
-        def benchmark(self, hostname, ips):
+        def __init__(self, *args):
+            pass
+        def benchmark(self, hostname, ips, **kwargs):
             assert ips == ["1.1.1.1", "9.9.9.9"]
             return [result("1.1.1.1", 100), result("9.9.9.9", 200)]
     monkeypatch.setattr(main_module, "AdGuardClient", FakeAdGuard)
     monkeypatch.setattr(main_module, "discover_adguard", lambda configured_url: ["http://adguard"])
     monkeypatch.setattr(main_module, "PublicDnsDiscovery", FakeDiscovery)
     monkeypatch.setattr(main_module, "HttpsBenchmarkRunner", FakeRunner)
+    db_url = f"sqlite:///{(tmp_path / 'cli.db').as_posix()}"
+    db = Database(db_url)
+    Base.metadata.create_all(db.engine)
+    monkeypatch.setattr(main_module, "Database", lambda: Database(db_url))
     assert main_module.benchmark_command("example.com") == 0
     output = json.loads(capsys.readouterr().out)
     assert output["current_ip"] == "9.9.9.9"
     assert output["current_rewrite_included"] is True
     assert output["decision"]["action"] == "HOLD"
+    with Database(db_url).session() as session:
+        from app.db.models import BenchmarkRunRecord
+        from sqlalchemy import select
+        saved_run = session.scalar(select(BenchmarkRunRecord))
+        assert saved_run and saved_run.decision_action == "HOLD"
+        assert get_pending_state(session, saved_run.target_id) == PendingCandidateState(candidate_ip="1.1.1.1", consecutive_wins=1)
+    # A fresh session sees the persisted win streak.
+    with Database(db_url).session() as session:
+        assert get_pending_state(session, 1).consecutive_wins == 1
+    assert main_module.benchmark_command("example.com") == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["decision"]["action"] == "UPDATE"
 
 
 def test_adguard_check_is_read_only_and_hides_credentials(monkeypatch, capsys):
