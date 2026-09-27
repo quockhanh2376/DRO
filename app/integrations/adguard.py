@@ -115,6 +115,8 @@ def configured_adguard_client() -> AdGuardClient:
     """Create a client only when runtime configuration identifies one endpoint."""
     load_secret_environment()
     endpoints = discover_adguard(os.getenv("ADGUARD_URL"))
-    if len(endpoints) != 1:
-        raise AdGuardError("AdGuard endpoint is unavailable or ambiguous")
+    if not endpoints:
+        raise AdGuardError("No AdGuard endpoint discovered")
+    if len(endpoints) > 1:
+        raise AdGuardError("Multiple AdGuard endpoints discovered")
     return AdGuardClient(base_url=endpoints[0])

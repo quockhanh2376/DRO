@@ -28,7 +28,12 @@ def read_adguard_rewrite(hostname: str) -> tuple[str | None, bool]:
     try:
         client = configured_adguard_client()
     except AdGuardError as exc:
-        logger.warning("Current AdGuard rewrite unavailable host=%s error=%s", hostname, exc)
+        if str(exc) == "No AdGuard endpoint discovered":
+            logger.warning("Current AdGuard rewrite unavailable: no endpoint discovered host=%s", hostname)
+        elif str(exc) == "Multiple AdGuard endpoints discovered":
+            logger.warning("Current AdGuard rewrite unavailable: multiple endpoints discovered host=%s", hostname)
+        else:
+            logger.warning("Current AdGuard rewrite unavailable host=%s error=%s", hostname, exc)
         return None, False
     try:
         rewrite = client.get_rewrite(hostname)

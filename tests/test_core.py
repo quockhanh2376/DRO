@@ -59,11 +59,35 @@ def test_statistics_and_health_threshold():
     assert not calculate_statistics(samples[:7] + [BenchmarkSample(ip="1.2.3.4", run_number=8)] * 3, 10).healthy
 
 
+def test_statistics_edge_cases_do_not_require_pstdev_for_zero_or_one_sample(monkeypatch):
+    one = BenchmarkSample(ip="1.2.3.4", run_number=1, http_status=200,
+                          connect_ms=1, tls_ms=2, total_ms=3)
+    original_pstdev = benchmark_module.statistics.pstdev
+
+    def fail_for_single_sample(values):
+        if len(values) < 2:
+            raise benchmark_module.statistics.StatisticsError("at least two samples required")
+        return original_pstdev(values)
+
+    monkeypatch.setattr(benchmark_module.statistics, "pstdev", fail_for_single_sample)
+    assert calculate_statistics([]).jitter_ms is None
+    assert calculate_statistics([one]).jitter_ms == 0.0
+    assert calculate_statistics([one, one.model_copy(update={"run_number": 2, "total_ms": 5})]).jitter_ms == 1.0
+
+
 def test_candidate_ranking():
     ranked = rank_candidates([result("1.1.1.1", 100, median=95, jitter=8),
                               result("2.2.2.2", 100, median=90, jitter=9),
                               result("3.3.3.3", 100, median=90, jitter=2), result("4.4.4.4", 1, False)])
     assert [r.ip for r in ranked] == ["3.3.3.3", "2.2.2.2", "1.1.1.1"]
+
+
+def test_candidate_ranking_accepts_missing_median_or_jitter():
+    candidates = [
+        BenchmarkResult(ip="1.1.1.1", healthy=True, average_ms=10, median_ms=None, jitter_ms=None),
+        BenchmarkResult(ip="2.2.2.2", healthy=True, average_ms=10, median_ms=20, jitter_ms=1),
+    ]
+    assert [candidate.ip for candidate in rank_candidates(candidates)] == ["2.2.2.2", "1.1.1.1"]
 
 
 def test_decision_keep_hold_update_threshold_and_streak_reset():
@@ -92,6 +116,30 @@ def test_failover_and_manual_lock():
     assert engine.decide(current.ip, current, [current, alternative], manual_lock_ip=current.ip).action == "LOCKED"
 
 
+@pytest.mark.parametrize("manual_lock_ip", [None, "", "  ", "192.0.2.10"])
+def test_manual_lock_requires_non_whitespace_ip(manual_lock_ip):
+    engine = DecisionEngine()
+    current = result("192.0.2.1", 100)
+    alternative = result("192.0.2.2", 40)
+    decision = engine.decide(current.ip, current, [current, alternative], manual_lock_ip=manual_lock_ip)
+    if manual_lock_ip and manual_lock_ip.strip():
+        assert decision.action == "LOCKED"
+    else:
+        assert decision.action == "HOLD"
+
+
+def test_failover_does_not_consume_pending_wins():
+    engine = DecisionEngine()
+    current = result("192.0.2.1", 100, healthy=False)
+    alternative = result("192.0.2.2", 90)
+    decision = engine.decide(
+        current.ip, current, [current, alternative],
+        pending=PendingCandidateState(candidate_ip=alternative.ip, consecutive_wins=1),
+    )
+    assert decision.action == "FAILOVER"
+    assert decision.wins == 0
+
+
 def test_doh_follows_cname_deduplicates_and_skips_invalid_records():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.params["name"] == "example.com":
@@ -102,6 +150,52 @@ def test_doh_follows_cname_deduplicates_and_skips_invalid_records():
             {"type": 1, "data": "1.2.3.4"}, {"type": 1, "data": "5.6.7.8"}]})
     client = httpx.Client(transport=httpx.MockTransport(handler))
     assert PublicDnsDiscovery(client).discover("example.com") == ["1.2.3.4", "5.6.7.8"]
+
+
+def test_doh_cname_cycle_raises_instead_of_returning_without_an_ip():
+    def handler(request: httpx.Request) -> httpx.Response:
+        target = "b.example.com." if request.url.params["name"] == "a.example.com" else "a.example.com."
+        return httpx.Response(200, json={"Status": 0, "Answer": [{"type": 5, "data": target}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(DiscoveryError, match="no IP"):
+        PublicDnsDiscovery(client).discover("a.example.com")
+
+
+def test_doh_cname_chain_is_limited_to_eight_hops():
+    def handler(request: httpx.Request) -> httpx.Response:
+        name = request.url.params["name"]
+        index = int(name.removeprefix("node").removesuffix(".example.com"))
+        if index < 9:
+            return httpx.Response(200, json={"Status": 0, "Answer": [
+                {"type": 5, "data": f"node{index + 1}.example.com."}
+            ]})
+        return httpx.Response(200, json={"Status": 0, "Answer": [
+            {"type": 1, "data": "1.2.3.4"}
+        ]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(DiscoveryError, match="no IP"):
+        PublicDnsDiscovery(client).discover("node0.example.com")
+
+
+def test_doh_later_lookup_failure_keeps_an_already_found_ip():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["name"] == "example.com":
+            return httpx.Response(200, json={"Status": 0, "Answer": [
+                {"type": 1, "data": "1.2.3.4"},
+                {"type": 5, "data": "broken.example.net."},
+            ]})
+        return httpx.Response(503)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert PublicDnsDiscovery(client).discover("example.com") == ["1.2.3.4"]
+
+
+def test_doh_lookup_failure_without_an_ip_raises():
+    client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(503)))
+    with pytest.raises(DiscoveryError, match="no IP"):
+        PublicDnsDiscovery(client).discover("example.com")
 
 
 def test_malformed_doh_raises_clear_error():
@@ -183,7 +277,8 @@ def test_configured_adguard_client_requires_exactly_one_endpoint(monkeypatch, en
     if len(endpoints) == 1:
         assert configured_adguard_client() == endpoints[0]
     else:
-        with pytest.raises(AdGuardError, match="unavailable or ambiguous"):
+        expected = "No AdGuard endpoint discovered" if not endpoints else "Multiple AdGuard endpoints discovered"
+        with pytest.raises(AdGuardError, match=expected):
             configured_adguard_client()
 
 

@@ -35,6 +35,22 @@ def test_adguard_lookup_requires_exactly_one_endpoint(monkeypatch, endpoints):
     assert optimizer.read_adguard_rewrite("example.com") == (None, False)
 
 
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        ("No AdGuard endpoint discovered", "no endpoint discovered"),
+        ("Multiple AdGuard endpoints discovered", "multiple endpoints discovered"),
+    ],
+)
+def test_adguard_lookup_logs_distinct_endpoint_discovery_failures(monkeypatch, error, message):
+    warnings = []
+    monkeypatch.setattr(optimizer, "configured_adguard_client",
+                        lambda: (_ for _ in ()).throw(AdGuardError(error)))
+    monkeypatch.setattr(optimizer.logger, "warning", lambda template, *args: warnings.append(template % args))
+    assert optimizer.read_adguard_rewrite("example.com") == (None, False)
+    assert message in warnings[0]
+
+
 @pytest.mark.parametrize("current_is_public", [False, True])
 def test_public_ips_remain_distinct_from_ordered_candidates(monkeypatch, tmp_path, current_is_public):
     public = ["1.1.1.1", "2.2.2.2", "1.1.1.1"]
