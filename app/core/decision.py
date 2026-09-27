@@ -8,7 +8,9 @@ from app.models.benchmark import BenchmarkResult, DecisionResult, PendingCandida
 def rank_candidates(candidates: list[BenchmarkResult]) -> list[BenchmarkResult]:
     """Rank healthy candidates by average, then median, then jitter (ascending)."""
     return sorted((candidate for candidate in candidates if candidate.healthy and candidate.average_ms is not None),
-                  key=lambda result: (result.average_ms, result.median_ms, result.jitter_ms))
+                  key=lambda result: (result.average_ms,
+                                      result.median_ms if result.median_ms is not None else float("inf"),
+                                      result.jitter_ms if result.jitter_ms is not None else float("inf")))
 
 
 class DecisionEngine:
@@ -21,7 +23,7 @@ class DecisionEngine:
         ranked = rank_candidates(candidates)
         current_result = next((result for result in candidates if result.ip == current_ip), current)
         winner = ranked[0] if ranked else None
-        if manual_lock_ip is not None:
+        if manual_lock_ip is not None and manual_lock_ip.strip():
             return DecisionResult(action="LOCKED", current_ip=current_ip, candidate_ip=manual_lock_ip,
                                   reason="Manual lock is active; automatic rewrite is disabled.")
         if current_ip and (current_result is None or not current_result.healthy):

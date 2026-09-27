@@ -27,7 +27,7 @@ def calculate_statistics(samples: Sequence[BenchmarkSample], requested_runs: int
         average_ms=statistics.fmean(times) if times else None,
         median_ms=statistics.median(times) if times else None,
         min_ms=min(times) if times else None, max_ms=max(times) if times else None,
-        jitter_ms=statistics.pstdev(times) if times else None,
+        jitter_ms=(None if not times else 0.0 if len(times) == 1 else statistics.pstdev(times)),
     )
 
 

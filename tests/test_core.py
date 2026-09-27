@@ -59,11 +59,35 @@ def test_statistics_and_health_threshold():
     assert not calculate_statistics(samples[:7] + [BenchmarkSample(ip="1.2.3.4", run_number=8)] * 3, 10).healthy
 
 
+def test_statistics_edge_cases_do_not_require_pstdev_for_zero_or_one_sample(monkeypatch):
+    one = BenchmarkSample(ip="1.2.3.4", run_number=1, http_status=200,
+                          connect_ms=1, tls_ms=2, total_ms=3)
+    original_pstdev = benchmark_module.statistics.pstdev
+
+    def fail_for_single_sample(values):
+        if len(values) < 2:
+            raise benchmark_module.statistics.StatisticsError("at least two samples required")
+        return original_pstdev(values)
+
+    monkeypatch.setattr(benchmark_module.statistics, "pstdev", fail_for_single_sample)
+    assert calculate_statistics([]).jitter_ms is None
+    assert calculate_statistics([one]).jitter_ms == 0.0
+    assert calculate_statistics([one, one.model_copy(update={"run_number": 2, "total_ms": 5})]).jitter_ms == 1.0
+
+
 def test_candidate_ranking():
     ranked = rank_candidates([result("1.1.1.1", 100, median=95, jitter=8),
                               result("2.2.2.2", 100, median=90, jitter=9),
                               result("3.3.3.3", 100, median=90, jitter=2), result("4.4.4.4", 1, False)])
     assert [r.ip for r in ranked] == ["3.3.3.3", "2.2.2.2", "1.1.1.1"]
+
+
+def test_candidate_ranking_accepts_missing_median_or_jitter():
+    candidates = [
+        BenchmarkResult(ip="1.1.1.1", healthy=True, average_ms=10, median_ms=None, jitter_ms=None),
+        BenchmarkResult(ip="2.2.2.2", healthy=True, average_ms=10, median_ms=20, jitter_ms=1),
+    ]
+    assert [candidate.ip for candidate in rank_candidates(candidates)] == ["2.2.2.2", "1.1.1.1"]
 
 
 def test_decision_keep_hold_update_threshold_and_streak_reset():
@@ -90,6 +114,30 @@ def test_failover_and_manual_lock():
     current, alternative = result("1.1.1.1", 100, healthy=False), result("2.2.2.2", 150)
     assert engine.decide(current.ip, current, [current, alternative]).action == "FAILOVER"
     assert engine.decide(current.ip, current, [current, alternative], manual_lock_ip=current.ip).action == "LOCKED"
+
+
+@pytest.mark.parametrize("manual_lock_ip", [None, "", "  ", "192.0.2.10"])
+def test_manual_lock_requires_non_whitespace_ip(manual_lock_ip):
+    engine = DecisionEngine()
+    current = result("192.0.2.1", 100)
+    alternative = result("192.0.2.2", 40)
+    decision = engine.decide(current.ip, current, [current, alternative], manual_lock_ip=manual_lock_ip)
+    if manual_lock_ip and manual_lock_ip.strip():
+        assert decision.action == "LOCKED"
+    else:
+        assert decision.action == "HOLD"
+
+
+def test_failover_does_not_consume_pending_wins():
+    engine = DecisionEngine()
+    current = result("192.0.2.1", 100, healthy=False)
+    alternative = result("192.0.2.2", 90)
+    decision = engine.decide(
+        current.ip, current, [current, alternative],
+        pending=PendingCandidateState(candidate_ip=alternative.ip, consecutive_wins=1),
+    )
+    assert decision.action == "FAILOVER"
+    assert decision.wins == 0
 
 
 def test_doh_follows_cname_deduplicates_and_skips_invalid_records():
