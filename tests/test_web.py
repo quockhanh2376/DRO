@@ -70,6 +70,14 @@ def test_runtime_version_is_only_shown_in_global_header(web):
     assert VERSION_DISPLAY not in login.text
 
 
+def test_global_header_version_is_small_and_regular_weight():
+    stylesheet = (Path(__file__).parents[1] / "app/web/static/style.css").read_text()
+    rules = re.search(r"\.brand\s+\.brand-version\{([^}]*)\}", stylesheet)
+    assert rules
+    assert "font-size:16px" in rules.group(1)
+    assert "font-weight:400" in rules.group(1)
+
+
 def test_dashboard_and_targets_render(web):
     client, _database = web
     dashboard = client.get("/")
@@ -330,13 +338,14 @@ def test_live_ping_start_selects_best_and_renders_console_with_stop_control(web,
         def start(self, identifier, ip):
             calls.append((identifier, ip))
             return SimpleNamespace(target_id=identifier, ip=ip, lines=["64 bytes from 192.0.2.11: time=4 ms"],
-                                   lock=Lock(), started_at=datetime.now(timezone.utc))
+                                   lock=Lock(), started_at=datetime(2026, 9, 27, 3, 0, tzinfo=timezone.utc))
 
     monkeypatch.setattr(web_routes, "ping_sessions", FakePings())
     response = client.post(f"/targets/{target_id}/ping", headers={"HX-Request": "true"})
     assert response.status_code == 200 and calls == [(target_id, "192.0.2.11")]
     assert f'hx-get="/targets/{target_id}/ping/output"' in page.text
     assert "Live ping" in response.text and "64 bytes from 192.0.2.11" in response.text
+    assert "27-09-2026 10:00:00 VNTime" in response.text
     assert f'/targets/{target_id}/ping/stop' in response.text
     assert 'aria-label="Stop ping"' in response.text
     assert "ping-live-spinner" in response.text
@@ -513,7 +522,7 @@ def test_ui_formats_database_timestamps_in_vietnam_time(web):
 
     client, database = web
     utc_instant = datetime(2026, 9, 27, 3, 0, tzinfo=timezone.utc)
-    expected = "2026-09-27 10:00:00 ICT"
+    expected = "27-09-2026 10:00:00 VNTime"
     with database.session() as session:
         target = save_target(session, Target(hostname="timezone.example"))
         run = save_benchmark_run(session, target.id, [], {}, None)
