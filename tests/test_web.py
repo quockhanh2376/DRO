@@ -42,7 +42,7 @@ def test_global_header_uses_central_version_on_authenticated_pages(web, monkeypa
     import app.web.routes as web_routes
 
     client, database = web
-    assert VERSION_DISPLAY == "v1.0.0-rc.1"
+    assert VERSION_DISPLAY == "v1.0.8"
     monkeypatch.setattr(web_routes, "VERSION_DISPLAY", "v9.8.7-test")
     with database.session() as session:
         target = save_target(session, Target(hostname="version.example"))
@@ -51,13 +51,30 @@ def test_global_header_uses_central_version_on_authenticated_pages(web, monkeypa
         response = client.get(path)
         assert response.status_code == 200
         assert '<a class="brand" href="/">DRO <span class="brand-version">v9.8.7-test</span></a>' in response.text
+        assert response.text.count("v9.8.7-test") == 1
+        assert 'class="app-version"' not in response.text
+
+
+def test_runtime_version_is_only_shown_in_global_header(web):
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="version-once.example"))
+
+    for path in ("/", "/targets", f"/targets/{target.id}", "/history"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.text.count(VERSION_DISPLAY) == 1
+        assert response.text.count('class="brand-version"') == 1
+
+    login = client.get("/login")
+    assert VERSION_DISPLAY not in login.text
 
 
 def test_dashboard_and_targets_render(web):
     client, _database = web
     dashboard = client.get("/")
     assert dashboard.status_code == 200
-    assert client.app.version == "1.0.0rc1" and "v1.0.0-rc.1" in dashboard.text
+    assert client.app.version == "1.0.8" and "v1.0.8" in dashboard.text
     assert "Dashboard" in dashboard.text and "Runtime Settings" in dashboard.text
     assert dashboard.text.index("</table>") < dashboard.text.index('id="settings"')
     assert all(f'name="{name}"' in dashboard.text for name in (

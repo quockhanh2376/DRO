@@ -11,6 +11,6 @@
     <a href="/">Dashboard</a><a href="/targets">Targets</a><a href="/history">History</a>
     <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link" type="submit">Log out</button></form>
   </nav></header>
-  <main>{% block content %}{% endblock %}<footer class="app-version">{{ version }}</footer></main>
+  <main>{% block content %}{% endblock %}</main>
 </body>
 </html>
