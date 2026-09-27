@@ -152,6 +152,52 @@ def test_doh_follows_cname_deduplicates_and_skips_invalid_records():
     assert PublicDnsDiscovery(client).discover("example.com") == ["1.2.3.4", "5.6.7.8"]
 
 
+def test_doh_cname_cycle_raises_instead_of_returning_without_an_ip():
+    def handler(request: httpx.Request) -> httpx.Response:
+        target = "b.example.com." if request.url.params["name"] == "a.example.com" else "a.example.com."
+        return httpx.Response(200, json={"Status": 0, "Answer": [{"type": 5, "data": target}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(DiscoveryError, match="no IP"):
+        PublicDnsDiscovery(client).discover("a.example.com")
+
+
+def test_doh_cname_chain_is_limited_to_eight_hops():
+    def handler(request: httpx.Request) -> httpx.Response:
+        name = request.url.params["name"]
+        index = int(name.removeprefix("node").removesuffix(".example.com"))
+        if index < 9:
+            return httpx.Response(200, json={"Status": 0, "Answer": [
+                {"type": 5, "data": f"node{index + 1}.example.com."}
+            ]})
+        return httpx.Response(200, json={"Status": 0, "Answer": [
+            {"type": 1, "data": "1.2.3.4"}
+        ]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(DiscoveryError, match="no IP"):
+        PublicDnsDiscovery(client).discover("node0.example.com")
+
+
+def test_doh_later_lookup_failure_keeps_an_already_found_ip():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["name"] == "example.com":
+            return httpx.Response(200, json={"Status": 0, "Answer": [
+                {"type": 1, "data": "1.2.3.4"},
+                {"type": 5, "data": "broken.example.net."},
+            ]})
+        return httpx.Response(503)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert PublicDnsDiscovery(client).discover("example.com") == ["1.2.3.4"]
+
+
+def test_doh_lookup_failure_without_an_ip_raises():
+    client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(503)))
+    with pytest.raises(DiscoveryError, match="no IP"):
+        PublicDnsDiscovery(client).discover("example.com")
+
+
 def test_malformed_doh_raises_clear_error():
     client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"Answer": "bad"})))
     with pytest.raises(DiscoveryError, match="Malformed DNS-over-HTTPS"):
