@@ -15,6 +15,7 @@ from app.db.repositories import (add_rewrite_history, get_setting, save_benchmar
                                  save_optimizer_state, save_target)
 from app.models.benchmark import BenchmarkResult, DecisionResult, PendingCandidateState
 from app.models.target import Target
+from app.version import VERSION_DISPLAY
 from sqlalchemy import select
 
 
@@ -35,6 +36,21 @@ def web(tmp_path, monkeypatch):
         client.headers["x-csrf-token"] = csrf
         yield client, database
     database.close()
+
+
+def test_global_header_uses_central_version_on_authenticated_pages(web, monkeypatch):
+    import app.web.routes as web_routes
+
+    client, database = web
+    assert VERSION_DISPLAY == "v1.0.0-rc.1"
+    monkeypatch.setattr(web_routes, "VERSION_DISPLAY", "v9.8.7-test")
+    with database.session() as session:
+        target = save_target(session, Target(hostname="version.example"))
+
+    for path in ("/", "/targets", f"/targets/{target.id}", "/history"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert '<a class="brand" href="/">DRO <span class="brand-version">v9.8.7-test</span></a>' in response.text
 
 
 def test_dashboard_and_targets_render(web):
