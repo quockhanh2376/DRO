@@ -32,3 +32,40 @@ No dependency, secret, environment file, schema, migration, remote, or public AP
 ## Commit and rollback policy
 
 Each behavior cluster will be a small commit with a body describing why, old behavior, new behavior, and rollback. To undo the entire work, revert the implementation commits or restore the original SHA and listed paths.
+
+## Implementation results
+
+- Documentation/design commit: `3de8cdf`
+- AdGuard guard commit: `cdc6100`
+- Statistics/ranking/lock commit: `1cd810f`
+- Discovery commit: `634920a`
+- SHA before final documentation update: `634920a`
+
+### Tests and verification
+
+| Command | Result |
+|---|---|
+| `python -m pytest -q` before changes | `103 passed, 4 skipped, 1 warning` |
+| Focused AdGuard tests after Task 1 | `37 passed` for `tests/test_optimizer.py tests/test_core.py` |
+| Focused statistics/ranking/lock tests after Task 2 | `7 passed` |
+| Full suite after Task 2 | `112 passed, 4 skipped, 1 warning` |
+| Focused discovery tests after Task 3 | `6 passed` |
+| `python -m compileall -q app tests` | passed |
+| `git diff --check` | passed |
+| Final `python -m pytest -q` | `116 passed, 4 skipped, 1 warning` |
+
+The new tests were observed failing against the baseline for the intended defects: distinct AdGuard diagnostics, one-sample jitter protection, whitespace locks, and discovery cycle/depth/partial-failure behavior. The ranking test initially needed a tied-average case to exercise the nullable secondary sort keys; after that adjustment it failed on the baseline with the expected `TypeError` risk and passed after the total-key fix.
+
+No lint or typecheck command is configured in `pyproject.toml`.
+
+## Intentionally not changed
+
+- No Alembic migration, schema, API signature, secret, `.env`, credential, or remote configuration.
+- No healthy-rule threshold, AND policy, consecutive-win policy, manual lock behavior for valid IPs, or FAILOVER policy change.
+- No curl TLS flags, `--ssl-no-revoke` policy, benchmark parallelism, context-manager refactor, client cache, or transaction consolidation.
+- The existing syntactically correct `app.db.repositories` import and closed `BenchmarkResult(...)` call required no diff on this HEAD; module imports and the full suite verify them.
+- `current_rewrite_included` retains candidate-list semantics; `current_rewrite_in_public_dns` remains the public-DNS membership field.
+
+## Final state
+
+The branch contains only the documentation commit plus three small implementation commits. The working tree is clean. The final SHA is recorded by the last documentation commit immediately after this section is committed.
