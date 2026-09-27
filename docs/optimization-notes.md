@@ -40,6 +40,7 @@ Each behavior cluster will be a small commit with a body describing why, old beh
 - Statistics/ranking/lock commit: `1cd810f`
 - Discovery commit: `634920a`
 - SHA before final documentation update: `634920a`
+- SHA after verification documentation commit: `0d96cdb`
 
 ### Tests and verification
 
