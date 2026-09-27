@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import logging
 from sqlalchemy import func, select
 
 from app.core import optimizer
@@ -33,6 +34,21 @@ def test_adguard_lookup_requires_exactly_one_endpoint(monkeypatch, endpoints):
 
     monkeypatch.setattr(optimizer, "configured_adguard_client", unavailable)
     assert optimizer.read_adguard_rewrite("example.com") == (None, False)
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        ("No AdGuard endpoint discovered", "no endpoint discovered"),
+        ("Multiple AdGuard endpoints discovered", "multiple endpoints discovered"),
+    ],
+)
+def test_adguard_lookup_logs_distinct_endpoint_discovery_failures(monkeypatch, caplog, error, message):
+    monkeypatch.setattr(optimizer, "configured_adguard_client",
+                        lambda: (_ for _ in ()).throw(AdGuardError(error)))
+    with caplog.at_level(logging.WARNING, logger=optimizer.logger.name):
+        assert optimizer.read_adguard_rewrite("example.com") == (None, False)
+    assert message in caplog.text
 
 
 @pytest.mark.parametrize("current_is_public", [False, True])

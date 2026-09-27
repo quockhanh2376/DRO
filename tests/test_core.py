@@ -183,7 +183,8 @@ def test_configured_adguard_client_requires_exactly_one_endpoint(monkeypatch, en
     if len(endpoints) == 1:
         assert configured_adguard_client() == endpoints[0]
     else:
-        with pytest.raises(AdGuardError, match="unavailable or ambiguous"):
+        expected = "No AdGuard endpoint discovered" if not endpoints else "Multiple AdGuard endpoints discovered"
+        with pytest.raises(AdGuardError, match=expected):
             configured_adguard_client()
 
 

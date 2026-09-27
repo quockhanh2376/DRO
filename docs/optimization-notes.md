@@ -13,6 +13,7 @@
 | File | Planned change | Risk | Rollback |
 |---|---|---|---|
 | `app/core/optimizer.py` | AdGuard endpoint guard and rewrite inclusion semantics | Low: return/logging and summary-field behavior | `git checkout bb7fe5495fb8d9427c685d8f7eee445ba76a07e -- app/core/optimizer.py` |
+| `app/integrations/adguard.py` | Preserve zero-vs-multiple endpoint reason for callers | Low: exception message only | `git checkout bb7fe5495fb8d9427c685d8f7eee445ba76a07e -- app/integrations/adguard.py` |
 | `app/core/benchmark.py` | Correct statistics for 0/1/2 samples | Low: aggregate jitter edge cases | `git checkout bb7fe5495fb8d9427c685d8f7eee445ba76a07e -- app/core/benchmark.py` |
 | `app/core/decision.py` | Total ranking key and whitespace lock handling | Medium: candidate ordering/decision lock boundary | `git checkout bb7fe5495fb8d9427c685d8f7eee445ba76a07e -- app/core/decision.py` |
 | `app/core/discovery.py` | CNAME cycle/depth and partial-failure handling | Medium: DNS candidate set and error behavior | `git checkout bb7fe5495fb8d9427c685d8f7eee445ba76a07e -- app/core/discovery.py` |
