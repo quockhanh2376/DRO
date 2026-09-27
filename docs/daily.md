@@ -41,15 +41,15 @@
 
 ### Current state
 
-- Current package version: `0.1.0`; production deployment is running the reviewed working-tree build. Service status is active; application health returned `{"status":"ok"}`.
+- Current package version: `v1.0.0-rc.1`; production deployment is running the reviewed working-tree build. Service status is active; application health returned `{"status":"ok"}`.
 - Production host: `172.16.10.9`; app: `/opt/dro`; DB: `/var/lib/dro/dro.db`; env: `/etc/dro/dro.env`; service: `dro.service`; port: `18081`.
-- Access URL: [http://172.16.10.9:18081](http://172.16.10.9:18081). AdGuard UI: [http://172.16.10.9](http://172.16.10.9). DRO AdGuard API URL: `http://127.0.0.1`.
-- DB migration is `0005_fractional_intervals`; a pre-deploy SQLite backup was made at `/var/lib/dro/dro.db.pre-deploy-20260927`. Existing DB data was preserved and migrated in place. `/etc/dro/dro.env` remains `root:root`, mode `600`; secret values were not displayed.
-- `dro.service` listens on `0.0.0.0:18081` and `/health` is healthy. Production currently uses direct HTTP; HTTPS proxying and localhost-only Uvicorn binding are pending.
+- Public UI: [https://dro.aswigsyd.int](https://dro.aswigsyd.int); AdGuard UI: [https://adguard10.aswigsyd.int](https://adguard10.aswigsyd.int). Nginx terminates HTTPS on port 443. DRO backend is bound to `127.0.0.1:18081`; its AdGuard API URL is internal at `http://127.0.0.1:3001`.
+- DB migration is `0006_auto_apply`; a pre-deploy SQLite backup was made at `/var/lib/dro/dro.db.pre-deploy-20260927`. Existing DB data was preserved and migrated in place. `/etc/dro/dro.env` remains `root:root`, mode `600`; secret values were not displayed.
+- `dro.service` listens only on `127.0.0.1:18081`; `/health` is checked through the HTTPS proxy. Uvicorn trusts forwarded headers from loopback only. `DRO_HTTPS_ENABLED=true` makes session cookies Secure, HttpOnly, and SameSite=Lax.
 - `dns-optimizer.timer` is disabled/inactive. `/opt/dns-optimizer` remains intact for rollback.
 - UFW is enabled. LAN rules allow DNS 53 TCP/UDP, AdGuard UI 80, and DRO 18081. SSH is allowed, but current UFW rules allow SSH from Anywhere; restrict it to the admin LAN when practical.
-- Scheduler is disabled (persisted setting `false`); Run Now remains available. The default interval is two hours when no saved override exists; target-specific intervals govern scheduled runs. Settings now allow the default interval in minutes/hours, scheduler toggle, and log retention edits.
-- Application log retention defaults to 7 days; benchmark samples 30 days; benchmark runs 180 days; rewrite history is retained indefinitely.
+- At the earlier checkpoint below, scheduler state was disabled. Final RC validation found the production scheduler enabled, with a 60-minute default interval; target-specific intervals govern scheduled runs. Runtime Settings persist the scheduler, interval, and retention options.
+- At this earlier checkpoint, samples used 30-day and runs 180-day retention. The final release candidate below uses configurable 72-hour benchmark-history retention for runs/results/samples together; rewrite history remains indefinite.
 
 ### Completed today
 
@@ -57,7 +57,7 @@
 - Added web redirect-to-login behavior while keeping API authentication errors as JSON 401.
 - Added target-list HTMX Run Now with an inline result, and editable persisted Settings for the default interval, scheduler state, and log retention.
 - Deployed the current tree to `/opt/dro`; applied migration 0005 after preserving a DB backup. Authenticated Run Now returned the saved inline result fields (candidates, best IP, statistics, decision, reason, and timestamp). No DNS rewrite mutation was performed.
-- AdGuard read-only check succeeded at `http://127.0.0.1` and returned two rewrites. Production pytest: 62 passed, 1 deprecation warning. Local final pytest: 58 passed, 4 skipped, 1 deprecation warning.
+- AdGuard read-only check succeeded and returned two rewrites. Production pytest at that deployment: 62 passed, 1 deprecation warning. Local final pytest: 58 passed, 4 skipped, 1 deprecation warning.
 
 ### Known limitations and next tasks
 
@@ -65,4 +65,45 @@
 - Add HTTPS reverse proxy and internal CA certificate, then enable Secure cookies and bind Uvicorn to localhost.
 - Monitor the first scheduled benchmark cycles after enabling the scheduler. Keep `/opt/dns-optimizer` as rollback until DRO proves stable.
 - SSH currently has a world-open UFW rule. Restrict it to the management LAN.
-- The installer-generated default service unit binds to localhost, but production currently uses the required direct `0.0.0.0:18081` listener; reconcile the unit configuration when introducing the reverse proxy.
+- Keep Nginx proxy headers aligned with the loopback-only Uvicorn trust configuration when maintaining either virtual host.
+
+### HTTPS topology deployment verification
+
+- Set production `ADGUARD_URL` to internal `http://127.0.0.1:3001` and `DRO_HTTPS_ENABLED=true`, preserving all other `/etc/dro/dro.env` values and its `root:root 600` permissions.
+- Deployed the latest tested code. `dro.service` is active and bound only to `127.0.0.1:18081`; the conflicting `dro-phase5-validation.service` was disabled while its files under `/opt/dro/phase5-validation` were left intact.
+- Nginx sends `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto`; Uvicorn trusts forwarded headers only from loopback. HTTPS login, Secure/HttpOnly/SameSite cookie flags, and CSRF-protected Run Now were verified through `https://dro.aswigsyd.int`.
+- Current rewrite lookup now returns `app.practicemanager.xero.com -> 113.171.12.186` from AdGuard. Read-only Web Run Now showed the current rewrite inline and rendered Apply Best IP when its conditions were met. Apply was not clicked; no DNS rewrite changed.
+- Production pytest: 71 passed, 1 deprecation warning. No migration was needed; database revision remained `0005_fractional_intervals`.
+
+## 2026-09-27 — v1.0.0-rc.1 final review and validation
+
+### Release state
+
+- Release candidate `v1.0.0-rc.1` is built from the central version in `app/version.py` and is deployed on production. The web UI displays the release string; FastAPI metadata and package metadata use the corresponding normalized `1.0.0rc1` version.
+- Supported product scope remains HTTPS/Web targets on one DRO host. No TCP/RDS, distributed agent, or container work is included.
+- Production topology: `https://dro.aswigsyd.int` through Nginx to `127.0.0.1:18081`; `https://adguard10.aswigsyd.int` through Nginx to AdGuard UI/API backend `127.0.0.1:3001`. Nginx configuration was not changed.
+- Host: `172.16.10.9`; app: `/opt/dro`; database: `/var/lib/dro/dro.db`; credentials: `/etc/dro/dro.env`; logs: `/var/log/dro`; service: `dro.service`; public HTTPS port: `443`; backend port: `18081`.
+- Host and service timezone is `Asia/Ho_Chi_Minh` (UTC+7). SQLite timestamps remain UTC; UI timestamps display in ICT. Historical database timestamps were not rewritten.
+- Current persisted runtime settings: scheduler enabled; default interval 60 minutes; log retention 5 days; benchmark history retention 72 hours; maximum 5 automatic rewrites/day. The global Automatic DNS Rewrite master and Auto Apply for both current targets are enabled. Existing decision, health, readback, rate-limit, lock, and rollback safeguards remain active.
+- Application log retention is 7 days. Benchmark runs, aggregate results, and samples are cleaned together after the configured retention (default 72 hours); rewrite history remains indefinitely.
+
+### Final validation
+
+- Local full pytest: 103 passed, 4 skipped. Focused security/UI/optimizer/queue/ping tests: 83 passed. One upstream Starlette/httpx deprecation warning remains.
+- Ubuntu full pytest under the `dro` account: 107 passed, one upstream deprecation warning. Python compile/import checks passed. Temporary SQLite migration upgrade, downgrade, and re-upgrade passed; production was already at `0006_auto_apply`, so no schema migration was needed.
+- Production service is enabled and active, HTTPS `/health` returns `{"status":"ok"}`, and the UI opens after login. The backend listens only on `127.0.0.1:18081`; the host reports `Asia/Ho_Chi_Minh`; the UI displays the version and ICT timestamps.
+- Read-only AdGuard lookups succeeded for both configured targets, and displayed Current IP matched AdGuard for 2/2 targets. A production Run Now benchmark completed and persisted its result. Production Ping start/stop and Apply button eligibility were verified. No Apply action or DNS rewrite was performed.
+- Logrotate dry-run is valid. Ubuntu pytest covers installer behavior and SQLite backup/restore using temporary databases. Production `/etc/dro/dro.env` remains `root:root 600`; `/var/lib/dro/dro.db` remains `dro:dro 600`; `/var/log/dro` remains `dro:dro 750`.
+- Legacy `dns-optimizer.timer` remains inactive and `/opt/dns-optimizer` was not modified. Production database integrity check returned `ok`.
+
+### Known limitations and rollback
+
+- Benchmark queue and live ping process tracking are in-memory and assume the single configured DRO service instance. The scheduler remains disabled pending deliberate production monitoring.
+- SSH is still allowed from any source by the existing firewall configuration; restrict it to the management LAN when practical.
+- No production DNS change was made for release validation. If the candidate must be rolled back, restore the previous application files under `/opt/dro` and restart `dro.service`; keep the current database because this release did not change its schema. `/opt/dns-optimizer` remains available as a separate legacy rollback path.
+
+### Next recommended checks
+
+- Commit and publish the validated release candidate with tag `v1.0.0-rc.1`.
+- Review SSH firewall scope and monitor scheduled benchmark windows and automatic rewrite audit events.
+- Monitor the first scheduled cycles and verify any future rewrite manually from the UI; retain the legacy optimizer until DRO is proven stable.

@@ -16,6 +16,7 @@ class TargetPatch(BaseModel):
 
     hostname: str | None = None
     enabled: bool | None = None
+    auto_apply: bool | None = None
     protocol: str | None = None
     port: int | None = None
     path: str | None = None

@@ -9,9 +9,10 @@ User=dro
 Group=dro
 WorkingDirectory=/opt/dro
 EnvironmentFile=/etc/dro/dro.env
+Environment=TZ=Asia/Ho_Chi_Minh
 Environment=DRO_DATABASE_URL=sqlite:////var/lib/dro/dro.db
 ExecStartPre=/opt/dro/.venv/bin/alembic -c /opt/dro/alembic.ini upgrade head
-ExecStart=/opt/dro/.venv/bin/uvicorn app.api.application:app --host 127.0.0.1 --port 8000 --no-access-log
+ExecStart=/opt/dro/.venv/bin/uvicorn app.api.application:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-access-log
 Restart=on-failure
 RestartSec=5s
 UMask=0027

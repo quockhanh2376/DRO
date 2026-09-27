@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from ipaddress import IPv4Address
 from pydantic import BaseModel, Field, ValidationError
@@ -23,6 +21,7 @@ from app.db.repositories import (
     list_rewrite_history as repo_list_rewrite_history,
     list_targets as repo_list_targets, save_target, set_setting,
 )
+from app.time_utils import next_run_time
 from app.models.target import Target
 from app.api.schemas import TargetCreate, TargetPatch, TargetRead
 from app.auth import protect_destructive, protect_mutation, require_admin
@@ -118,7 +117,7 @@ def patch_target(target_id: int, body: TargetPatch, session: Session = Depends(g
         saved = save_target(session, updated, record=record)
         schedule = session.get(ScheduleStateRecord, target_id)
         if schedule and schedule.last_run_at and "interval_hours" in body.model_fields_set:
-            schedule.next_run_at = schedule.last_run_at + timedelta(hours=saved.interval_hours)
+            schedule.next_run_at = next_run_time(schedule.last_run_at, saved.interval_hours)
         if old_lock != saved.manual_lock_ip:
             add_audit_event(session, "ip_locked" if saved.manual_lock_ip else "ip_unlocked", target_id,
                             {"old_ip": old_lock, "ip": saved.manual_lock_ip})

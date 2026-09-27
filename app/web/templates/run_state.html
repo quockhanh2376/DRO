@@ -1,0 +1,3 @@
+{% if run_status == 'running' %}<span id="run-state-indicator-{{ target.id }}" class="activity-spinner benchmark-spinner" role="status" aria-label="Benchmark running" title="Benchmark running"></span>{% elif run_status == 'queued' %}<span class="queued-state" role="status">Queued #{{ queue_position }}</span>{% endif %}
+{% set button_oob = true %}{% include "play_button.html" %}
+<div id="run-result-{{ target.id }}" hx-swap-oob="innerHTML">{% if latest %}{% include "benchmark_result.html" %}{% endif %}</div>

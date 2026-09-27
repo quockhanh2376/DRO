@@ -22,6 +22,7 @@ class TargetRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     hostname: Mapped[str] = mapped_column(String(253), unique=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    auto_apply: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
     protocol: Mapped[str] = mapped_column(String(10), default="https")
     port: Mapped[int] = mapped_column(Integer, default=443)
     path: Mapped[str] = mapped_column(String(2048), default="/")

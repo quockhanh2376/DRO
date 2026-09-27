@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -17,19 +16,28 @@ from app.api.routes import (LockRequest, RollbackRequest, get_target_or_404,
                             unlock_target as api_unlock_target)
 from app.api.schemas import TargetPatch
 from app.auth import _csrf_token, protect_mutation, require_admin
-from app.db.models import BenchmarkRunRecord, OptimizerStateRecord, RewriteHistoryRecord, ScheduleStateRecord
+from app.db.models import (BenchmarkRunRecord, OptimizerStateRecord, RewriteHistoryRecord,
+                           ScheduleStateRecord, TargetRecord)
 from app.db.dependencies import get_session
 from app.db.repositories import (
     add_audit_event, get_benchmark_run, get_setting, list_benchmark_runs, list_rewrite_history,
     list_targets, save_target, set_setting,
 )
+from app.db.retention import clear_benchmark_history, configured_benchmark_history_retention
 from app.models.target import Target
-from app.core.scheduler import (RunAlreadyActive, default_interval, default_interval_hours,
+from app.core.scheduler import (default_interval, default_interval_hours,
                                 record_target_run, scheduler_enabled, set_scheduler_enabled)
+from app.core.optimizer import read_adguard_rewrite
+from app.core.rewrites import automatic_rewrite_enabled, set_rewrite
+from app.integrations.adguard import AdGuardError
+from app.core.live_ping import PingLimitReached, PingSession, ping_sessions
+from app.time_utils import format_vietnam_time, next_run_time
+from app.version import VERSION_DISPLAY
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["web"])
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
+templates.env.filters["vn_time"] = format_vietnam_time
 
 
 def _best_benchmark_result(run):
@@ -43,7 +51,17 @@ def _best_benchmark_result(run):
 
 
 def _base_context(request: Request, **values):
-    return {"request": request, "csrf_token": _csrf_token(request), **values}
+    return {"request": request, "csrf_token": _csrf_token(request),
+            "version": VERSION_DISPLAY, **values}
+
+
+def _persist_verified_current_ip(session: Session, target_id: int, current_ip: str | None) -> None:
+    state = session.get(OptimizerStateRecord, target_id)
+    if state is None:
+        state = OptimizerStateRecord(target_id=target_id)
+        session.add(state)
+    state.current_rewrite_ip = current_ip
+    session.commit()
 
 
 def _dashboard_rows(session: Session) -> list[dict]:
@@ -65,9 +83,7 @@ def _dashboard_rows(session: Session) -> list[dict]:
         if current and best and current.average_ms and best.average_ms is not None:
             improvement = max(0.0, (current.average_ms - best.average_ms) / current.average_ms * 100)
         completed = run.completed_at if run else None
-        next_run = (completed.replace(tzinfo=timezone.utc) + timedelta(hours=target.interval_hours)
-                    if completed and completed.tzinfo is None else
-                    completed + timedelta(hours=target.interval_hours) if completed else None)
+        next_run = next_run_time(completed, target.interval_hours) if completed else None
         rows.append({"target": target, "state": state, "run": run, "best": best,
                      "current": current, "improvement": improvement,
                      "wins": state.consecutive_wins if state else 0,
@@ -78,18 +94,108 @@ def _dashboard_rows(session: Session) -> list[dict]:
     return rows
 
 
+def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, tuple]:
+    if not targets:
+        return {}
+    target_ids = [target.id for target in targets]
+    latest_runs = {}
+    runs = session.scalars(select(BenchmarkRunRecord).where(
+        BenchmarkRunRecord.target_id.in_(target_ids)
+    ).order_by(BenchmarkRunRecord.target_id, BenchmarkRunRecord.completed_at.desc(),
+               BenchmarkRunRecord.id.desc())).all()
+    for run in runs:
+        latest_runs.setdefault(run.target_id, (run, _best_benchmark_result(run)))
+    return latest_runs
+
+
 @router.get("/", response_class=HTMLResponse, name="dashboard", dependencies=[Depends(require_admin)])
 def dashboard(request: Request, session: Session = Depends(get_session)):
-    return templates.TemplateResponse(request, "dashboard.html",
-                                      _base_context(request, rows=_dashboard_rows(session)))
+    return _settings_response(request, session)
 
 
 @router.get("/targets", response_class=HTMLResponse, name="targets_page", dependencies=[Depends(require_admin)])
 def targets_page(request: Request, session: Session = Depends(get_session)):
+    targets = list_targets(session)
+    latest_runs = _latest_run_map(session, targets)
     return templates.TemplateResponse(request, "targets.html",
-                                      _base_context(request, targets=list_targets(session), target=None,
+                                      _base_context(request, targets=targets, latest_runs=latest_runs, target=None,
                                                     errors=None,
                                                     default_interval_hours=default_interval_hours(session)))
+
+
+@router.get("/targets/{target_id}/run/state", response_class=HTMLResponse,
+            name="run_state_page", dependencies=[Depends(require_admin)])
+def run_state_page(target_id: int, request: Request, session: Session = Depends(get_session)):
+    target = get_target_or_404(session, target_id)
+    run_status, queue_position = request.app.state.run_coordinator.state(target_id)
+    runs = list_benchmark_runs(session, target_id)
+    latest = get_benchmark_run(session, runs[0].id) if runs else None
+    return templates.TemplateResponse(request, "run_state.html", _base_context(
+        request, target=target, run_status=run_status, queue_position=queue_position,
+        latest=latest, best=_best_benchmark_result(latest)))
+
+
+@router.post("/targets/{target_id}/ping", response_class=HTMLResponse, name="ping_target_page",
+             dependencies=[Depends(protect_mutation)])
+def ping_target_page(target_id: int, request: Request, session: Session = Depends(get_session)):
+    target = get_target_or_404(session, target_id)
+    runs = list_benchmark_runs(session, target_id)
+    latest = get_benchmark_run(session, runs[0].id) if runs else None
+    best = _best_benchmark_result(latest)
+    state = session.get(OptimizerStateRecord, target_id)
+    current_ip = state.current_rewrite_ip if state else (latest.summary.get("current_rewrite_ip") if latest else None)
+    ip = best.ip if best else current_ip
+    ping_session = None
+    error = None
+    if ip:
+        try:
+            ping_session = ping_sessions.start(target_id, ip)
+        except PingLimitReached as exc:
+            raise HTTPException(status_code=429, detail="Too many active ping sessions") from exc
+        except (OSError, ValueError) as exc:
+            logger.warning("Live ping could not start target_id=%d error=%s", target_id, type(exc).__name__)
+            error = "Ping could not be started"
+    else:
+        error = "No IP available"
+    if ping_session:
+        logger.info("Live ping started target_id=%d ip=%s", target_id, ping_session.ip)
+    return _ping_response(request, target_id, ping_session, active=bool(ping_session),
+                          update_status=True, error=error)
+
+
+@router.get("/targets/{target_id}/ping/output", response_class=HTMLResponse,
+            name="ping_output_page", dependencies=[Depends(require_admin)])
+def ping_output_page(target_id: int, request: Request, session: Session = Depends(get_session)):
+    get_target_or_404(session, target_id)
+    ping_session = ping_sessions.get(target_id)
+    active = ping_sessions.is_active(target_id)
+    return _ping_response(request, target_id, ping_session, active=active,
+                          update_status=True)
+
+
+@router.post("/targets/{target_id}/ping/stop", response_class=HTMLResponse,
+             name="stop_ping_page", dependencies=[Depends(protect_mutation)])
+def stop_ping_page(target_id: int, request: Request, session: Session = Depends(get_session)):
+    get_target_or_404(session, target_id)
+    ping_session = ping_sessions.stop(target_id)
+    logger.info("Live ping stopped target_id=%d", target_id)
+    return _ping_response(request, target_id, ping_session, active=False, update_status=True)
+
+
+def _ping_response(request: Request, target_id: int, ping_session: PingSession | None,
+                   active: bool, update_status: bool, error: str | None = None):
+    lines = []
+    if ping_session:
+        with ping_session.lock:
+            lines = list(ping_session.lines)
+    return templates.TemplateResponse(request, "ping_console.html", {
+        "request": request, "target_id": target_id, "ping_session": ping_session,
+        "ip": ping_session.ip if ping_session else None,
+        "lines": lines, "started_at": ping_session.started_at if ping_session else None,
+        "stop_reason": getattr(ping_session, "stop_reason", None) if ping_session else None,
+        "active": active, "update_status": update_status, "error": error,
+        "csrf_token": _csrf_token(request),
+    })
 
 
 def _target_form_values(
@@ -122,8 +228,9 @@ def create_target_page(
         add_audit_event(session, "target_created", record.id, {"hostname": record.hostname})
     except (ValueError, TypeError) as exc:
         logger.info("Target creation rejected")
+        targets = list_targets(session)
         return templates.TemplateResponse(request, "targets.html", _base_context(
-            request, targets=list_targets(session), target=None, errors=[str(exc)],
+            request, targets=targets, latest_runs=_latest_run_map(session, targets), target=None, errors=[str(exc)],
             form_values=_target_form_values(hostname, enabled, mode, interval_hours, runs_per_ip,
                                             switch_threshold_ms, switch_threshold_percent, manual_lock_ip),
             default_interval_hours=default_interval_hours(session)),
@@ -136,8 +243,10 @@ def create_target_page(
             dependencies=[Depends(require_admin)])
 def edit_target_page(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
+    targets = list_targets(session)
     return templates.TemplateResponse(request, "targets.html",
-                                      _base_context(request, targets=list_targets(session), target=target,
+                                      _base_context(request, targets=targets,
+                                                    latest_runs=_latest_run_map(session, targets), target=target,
                                                     errors=None,
                                                     default_interval_hours=default_interval_hours(session)))
 
@@ -167,12 +276,14 @@ def update_target_page(
                             record.id, {"old_ip": old_lock, "ip": record.manual_lock_ip})
         schedule = session.get(ScheduleStateRecord, record.id)
         if schedule and schedule.last_run_at:
-            schedule.next_run_at = schedule.last_run_at + timedelta(hours=updated.interval_hours)
+            schedule.next_run_at = next_run_time(schedule.last_run_at, updated.interval_hours)
         add_audit_event(session, "target_updated", record.id, {"hostname": record.hostname})
     except (ValueError, TypeError) as exc:
         logger.info("Target update rejected target_id=%d", target_id)
+        targets = list_targets(session)
         return templates.TemplateResponse(request, "targets.html", _base_context(
-            request, targets=list_targets(session), target=record, errors=[str(exc)], form_values=values,
+            request, targets=targets, latest_runs=_latest_run_map(session, targets),
+            target=record, errors=[str(exc)], form_values=values,
             default_interval_hours=default_interval_hours(session)),
             status_code=422)
     logger.info("Target updated target_id=%d hostname=%s", target_id, record.hostname)
@@ -204,6 +315,9 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
     best = _best_benchmark_result(latest)
     return templates.TemplateResponse(request, "target_detail.html", _base_context(
         request, target=target, latest=latest, state=state, current=current, best=best,
+        current_ip_override=(state.current_rewrite_ip if state else
+                             latest.summary.get("current_rewrite_ip") if latest else None),
+        rewrite_result=request.query_params.get("rewrite"),
         runs=runs, rewrite_history=list_rewrite_history(session, target_id)))
 
 
@@ -211,27 +325,73 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
              dependencies=[Depends(protect_mutation)])
 def run_target_now(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
-    try:
-        with request.app.state.run_coordinator.run(target_id):
-            output = request.app.state.benchmark_cycle(session, target)
-            session.commit()
-            record_target_run(session, target)
-            session.commit()
-    except RunAlreadyActive as exc:
-        raise HTTPException(status_code=409, detail="A benchmark is already running for this target") from exc
-    except Exception as exc:
-        logger.warning("Manual benchmark failed target_id=%d error=%s", target_id, type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Benchmark could not be completed") from exc
-    logger.info("Manual benchmark completed target_id=%d hostname=%s", target_id, target.hostname)
+    hostname = target.hostname
+    database = request.app.state.database
+    cycle = request.app.state.benchmark_cycle
+
+    def execute() -> None:
+        with database.session() as run_session:
+            run_target = run_session.get(TargetRecord, target_id)
+            if run_target is None:
+                return
+            cycle(run_session, run_target)
+            record_target_run(run_session, run_target)
+            run_session.commit()
+        logger.info("Manual benchmark completed target_id=%d hostname=%s", target_id, hostname)
+
+    run_status, queue_position = request.app.state.run_coordinator.submit(target_id, execute)
+    logger.info("Manual benchmark accepted target_id=%d state=%s queue_position=%s",
+                target_id, run_status, queue_position)
     if request.headers.get("HX-Request", "").lower() == "true":
-        run_id = output.get("benchmark_run_id") if isinstance(output, dict) else None
-        latest = get_benchmark_run(session, run_id) if run_id else None
-        if latest is None:
-            runs = list_benchmark_runs(session, target_id)
-            latest = get_benchmark_run(session, runs[0].id) if runs else None
-        return templates.TemplateResponse(request, "benchmark_result.html", _base_context(
-            request, target=target, latest=latest, best=_best_benchmark_result(latest)))
+        runs = list_benchmark_runs(session, target_id)
+        latest = get_benchmark_run(session, runs[0].id) if runs else None
+        return templates.TemplateResponse(request, "run_state.html", _base_context(
+            request, target=target, run_status=run_status, queue_position=queue_position,
+            latest=latest, best=_best_benchmark_result(latest)))
     return RedirectResponse(f"/targets/{target_id}", status_code=303)
+
+
+@router.post("/targets/{target_id}/apply-best", name="apply_best_rewrite",
+             dependencies=[Depends(protect_mutation)])
+def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Form(...),
+                       new_ip: str = Form(...), confirm: bool = Form(False),
+                       session: Session = Depends(get_session)):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Explicit rewrite confirmation is required")
+    target = get_target_or_404(session, target_id)
+    run = get_benchmark_run(session, run_id)
+    runs = list_benchmark_runs(session, target_id)
+    if not run or run.target_id != target_id or not runs or runs[0].id != run_id:
+        raise HTTPException(status_code=409, detail="Apply Best IP requires the latest benchmark result")
+    if (run.summary.get("resolution_failed")
+            or not run.summary.get("current_rewrite_lookup_succeeded")
+            or run.summary.get("current_rewrite_ip") != old_ip):
+        raise HTTPException(status_code=409, detail="The benchmark did not verify the current rewrite")
+    best = _best_benchmark_result(run)
+    if not best or not best.healthy or best.ip != new_ip or best.ip == old_ip:
+        raise HTTPException(status_code=409, detail="The selected IP is not a healthy different best candidate")
+    live_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+    if not lookup_succeeded or live_ip != old_ip:
+        raise HTTPException(status_code=409, detail="Current AdGuard rewrite changed or could not be verified")
+    try:
+        outcome = set_rewrite(session, target, new_ip, "Manual Apply Best IP", run_id,
+                              expected_old_ip=old_ip)
+    except AdGuardError as exc:
+        current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+        _persist_verified_current_ip(session, target_id, current_ip if lookup_succeeded else None)
+        return RedirectResponse(f"/targets/{target_id}?rewrite=failed", status_code=303)
+    except Exception as exc:
+        logger.warning("Manual rewrite failed target_id=%d error=%s", target_id, type(exc).__name__)
+        current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+        _persist_verified_current_ip(session, target_id, current_ip if lookup_succeeded else None)
+        return RedirectResponse(f"/targets/{target_id}?rewrite=failed", status_code=303)
+    verified_current_ip = outcome.get("verified_current_ip")
+    _persist_verified_current_ip(session, target_id, verified_current_ip)
+    if outcome.get("rolled_back"):
+        return RedirectResponse(f"/targets/{target_id}?rewrite=rolled-back", status_code=303)
+    if not outcome.get("healthy") or verified_current_ip != new_ip:
+        return RedirectResponse(f"/targets/{target_id}?rewrite=failed", status_code=303)
+    return RedirectResponse(f"/targets/{target_id}?rewrite=applied", status_code=303)
 
 
 @router.post("/targets/{target_id}/lock", name="lock_target_page",
@@ -268,16 +428,30 @@ def history_page(request: Request, session: Session = Depends(get_session)):
         request, targets=targets, runs=runs, rewrites=rewrites))
 
 
+@router.post("/history/clear", name="clear_benchmark_history",
+             dependencies=[Depends(protect_mutation)])
+def clear_benchmark_history_page(request: Request, confirm: bool = Form(False),
+                                 session: Session = Depends(get_session)):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Confirmation is required to clear benchmark history")
+    counts = clear_benchmark_history(session)
+    add_audit_event(session, "benchmark_history_cleared", details=counts)
+    logger.info("Benchmark history cleared runs=%d results=%d samples=%d",
+                counts["runs_deleted"], counts["results_deleted"], counts["samples_deleted"])
+    return RedirectResponse("/history", status_code=303)
+
+
 @router.get("/settings", response_class=HTMLResponse, name="settings_page",
             dependencies=[Depends(require_admin)])
 def settings_page(request: Request, session: Session = Depends(get_session),
                   _auth=Depends(require_admin)):
-    return _settings_response(request, session)
+    return RedirectResponse("/#settings", status_code=303)
 
 
 def _settings_response(request: Request, session: Session, errors=None,
                        interval_value: str | None = None, interval_unit: str | None = None,
-                       retention_value: str | None = None, status_code: int = 200):
+                       retention_value: str | None = None, status_code: int = 200,
+                       history_value: str | None = None, history_unit: str | None = None):
     import os
     from app.security import safe_endpoint
 
@@ -286,15 +460,40 @@ def _settings_response(request: Request, session: Session, errors=None,
         log_retention_days = max(1, int(get_setting(session, "log_retention_days") or "7"))
     except ValueError:
         log_retention_days = 7
-    return templates.TemplateResponse(request, "settings.html", _base_context(
-        request, adguard_url=safe_endpoint(os.getenv("ADGUARD_URL") or "Not configured"),
+    configured_history_value, configured_history_unit = configured_benchmark_history_retention(session)
+    return templates.TemplateResponse(request, "dashboard.html", _base_context(
+        request, rows=_dashboard_rows(session),
+        adguard_url=safe_endpoint(os.getenv("ADGUARD_URL") or "Not configured"),
         scheduler_enabled=scheduler_enabled(session),
+        automatic_rewrite_enabled=automatic_rewrite_enabled(session),
         default_interval_value=interval_value if interval_value is not None else value,
         default_interval_unit=interval_unit if interval_unit is not None else unit,
         threshold_ms=50, threshold_percent=5,
         max_auto_changes=int(get_setting(session, "max_auto_changes_per_day") or "4"),
         log_retention_days=retention_value if retention_value is not None else log_retention_days,
-        errors=errors), status_code=status_code)
+        benchmark_history_value=history_value if history_value is not None else configured_history_value,
+        benchmark_history_unit=history_unit if history_unit is not None else configured_history_unit,
+        settings_errors=errors), status_code=status_code)
+
+
+@router.post("/settings/benchmark-history-retention", name="benchmark_history_retention_setting",
+             dependencies=[Depends(protect_mutation)])
+def benchmark_history_retention_setting(request: Request, value: str = Form(...),
+                                        unit: str = Form(...), session: Session = Depends(get_session)):
+    try:
+        parsed = int(value)
+        if parsed < 1 or unit not in {"hours", "days"}:
+            raise ValueError
+    except ValueError:
+        return _settings_response(request, session,
+                                  {"benchmark_history": "Enter a positive whole number and choose hours or days."},
+                                  status_code=422, history_value=value, history_unit=unit)
+    set_setting(session, "benchmark_history_retention_value", str(parsed))
+    set_setting(session, "benchmark_history_retention_unit", unit)
+    add_audit_event(session, "benchmark_history_retention_updated",
+                    details={"value": parsed, "unit": unit})
+    logger.info("Benchmark history retention updated value=%d unit=%s", parsed, unit)
+    return RedirectResponse("/#settings", status_code=303)
 
 
 @router.post("/settings/default-interval", name="default_interval_setting",
@@ -313,7 +512,7 @@ def default_interval_setting(request: Request, value: str = Form(...), unit: str
     set_setting(session, "default_interval_value", str(parsed))
     set_setting(session, "default_interval_unit", unit)
     add_audit_event(session, "default_interval_updated", details={"value": parsed, "unit": unit})
-    return RedirectResponse("/settings", status_code=303)
+    return RedirectResponse("/#settings", status_code=303)
 
 
 @router.post("/settings/log-retention", name="log_retention_setting",
@@ -329,14 +528,40 @@ def log_retention_setting(request: Request, days: str = Form(...),
                                   retention_value=days, status_code=422)
     set_setting(session, "log_retention_days", str(value))
     add_audit_event(session, "log_retention_updated", details={"days": value})
-    return RedirectResponse("/settings", status_code=303)
+    return RedirectResponse("/#settings", status_code=303)
 
 
 @router.post("/settings/scheduler", name="scheduler_setting",
              dependencies=[Depends(protect_mutation)])
 def scheduler_setting(enabled: bool = Form(False), session: Session = Depends(get_session)):
     set_scheduler_enabled(session, enabled)
-    return RedirectResponse("/settings", status_code=303)
+    return RedirectResponse("/#settings", status_code=303)
+
+
+@router.post("/settings/automatic-rewrite", name="automatic_rewrite_setting",
+             dependencies=[Depends(protect_mutation)])
+def automatic_rewrite_setting(enabled: bool = Form(False), confirm: bool = Form(False),
+                              session: Session = Depends(get_session)):
+    if enabled and not confirm:
+        raise HTTPException(status_code=400, detail="Confirmation is required to enable automatic DNS rewrites")
+    set_setting(session, "global_auto_master", str(enabled).lower())
+    add_audit_event(session, "automatic_rewrite_master_enabled" if enabled else
+                    "automatic_rewrite_master_disabled", details={"enabled": enabled})
+    logger.info("Automatic DNS Rewrite master switch %s", "enabled" if enabled else "disabled")
+    return RedirectResponse("/#settings", status_code=303)
+
+
+@router.post("/targets/{target_id}/auto-apply", name="target_auto_apply_setting",
+             dependencies=[Depends(protect_mutation)])
+def target_auto_apply_setting(target_id: int, enabled: bool = Form(False),
+                              session: Session = Depends(get_session)):
+    record = get_target_or_404(session, target_id)
+    record.auto_apply = enabled
+    add_audit_event(session, "target_auto_apply_enabled" if enabled else "target_auto_apply_disabled",
+                    record.id, {"enabled": enabled})
+    logger.info("Target Auto Apply %s target_id=%d hostname=%s",
+                "enabled" if enabled else "disabled", record.id, record.hostname)
+    return RedirectResponse("/targets", status_code=303)
 
 
 @router.post("/settings/change-limit", name="change_limit_setting",
@@ -346,4 +571,4 @@ def change_limit_setting(max_auto_changes_per_day: int = Form(4),
     if not 0 <= max_auto_changes_per_day <= 1000:
         raise HTTPException(status_code=422, detail="Change limit must be between 0 and 1000")
     set_setting(session, "max_auto_changes_per_day", str(max_auto_changes_per_day))
-    return RedirectResponse("/settings", status_code=303)
+    return RedirectResponse("/#settings", status_code=303)

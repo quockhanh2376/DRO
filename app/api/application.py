@@ -20,7 +20,9 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.core.optimizer import run_benchmark_cycle
 from app.db.database import Database
 from app.core.scheduler import RunCoordinator, SchedulerWorker
+from app.core.live_ping import ping_sessions
 from app.api.routes import router
+from app.version import __version__
 
 
 def create_app(database: Database | None = None, benchmark_cycle=run_benchmark_cycle) -> FastAPI:
@@ -38,17 +40,19 @@ def create_app(database: Database | None = None, benchmark_cycle=run_benchmark_c
         try:
             yield
         finally:
+            coordinator.stop()
             worker.stop()
+            ping_sessions.stop_all()
             if owns_scheduler_database:
                 scheduler_database.close()
 
-    application = FastAPI(title="DRO API", version="0.1.0", lifespan=lifespan)
+    application = FastAPI(title="DRO API", version=__version__, lifespan=lifespan)
     application.add_middleware(
         SessionMiddleware, secret_key=os.getenv("DRO_SESSION_SECRET") or secrets.token_urlsafe(48),
         session_cookie="dro_session", max_age=12 * 60 * 60, same_site="lax",
         https_only=os.getenv("DRO_HTTPS_ENABLED", "false").lower() in {"1", "true", "yes"},
     )
-    application.state.database = database
+    application.state.database = scheduler_database
     application.state.benchmark_cycle = benchmark_cycle
     application.state.run_coordinator = coordinator
     application.mount("/static", StaticFiles(directory=Path(__file__).resolve().parents[1] / "web" / "static"),

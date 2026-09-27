@@ -8,9 +8,9 @@
 </head>
 <body hx-boost="true">
   <header class="topbar"><a class="brand" href="/">DRO</a><nav>
-    <a href="/">Dashboard</a><a href="/targets">Targets</a><a href="/history">History</a><a href="/settings">Settings</a>
+    <a href="/">Dashboard</a><a href="/targets">Targets</a><a href="/history">History</a>
     <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link" type="submit">Log out</button></form>
   </nav></header>
-  <main>{% block content %}{% endblock %}</main>
+  <main>{% block content %}{% endblock %}<footer class="app-version">{{ version }}</footer></main>
 </body>
 </html>

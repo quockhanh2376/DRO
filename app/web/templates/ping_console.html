@@ -1,0 +1,8 @@
+{% if ping_session or error %}<section id="ping-live-{{ target_id }}" class="ping-live" role="status">
+  <header><strong>Live ping</strong>{% if ip %}<code>{{ ip }}</code>{% endif %}{% if started_at %}<time>{{ started_at|vn_time }}</time>{% endif %}</header>
+  {% if error %}<p>{{ error }}</p>{% endif %}
+  {% if stop_reason == 'timeout' %}<p class="ping-stopped">Stopped automatically after 60 seconds</p>{% elif not active and not error %}<p class="ping-stopped">Ping stopped.</p>{% endif %}
+  <pre class="ping-console-output">{% for line in lines %}{{ line }}
+{% else %}{% if active %}Starting ping...{% endif %}{% endfor %}</pre>
+</section>{% endif %}
+{% if update_status %}<div hx-swap-oob="innerHTML:#ping-status-{{ target_id }}">{% if active %}<span class="activity-spinner ping-live-spinner" role="status" aria-label="Ping running" title="Ping running"></span><form method="post" action="/targets/{{ target_id }}/ping/stop" hx-post="/targets/{{ target_id }}/ping/stop" hx-target="#ping-result-{{ target_id }}" hx-swap="innerHTML"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="stop-ping" type="submit" title="Stop ping" aria-label="Stop ping">&#215;</button></form>{% endif %}</div>{% endif %}

@@ -5,9 +5,10 @@ import sqlite3
 import os
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.api.application import create_app
 from app.core import rewrites
@@ -18,8 +19,10 @@ from app.db.models import (AdminCredentialRecord, AuditLogRecord, Base, Benchmar
                            RewriteHistoryRecord, ScheduleStateRecord, TargetRecord)
 from app.db.repositories import (add_rewrite_history, get_setting, save_benchmark_run,
                                  save_optimizer_state, save_target, set_setting)
-from app.db.retention import cleanup_retention, cleanup_rotated_logs
+from app.db.retention import (benchmark_history_retention, cleanup_retention,
+                             cleanup_rotated_logs, configured_benchmark_history_retention)
 from app.maintenance import backup_database, restore_database, validate_database
+from app.integrations.adguard import AdGuardClient, AdGuardError
 from app.models.benchmark import BenchmarkResult, DecisionResult, PendingCandidateState
 from app.models.target import Target
 
@@ -133,11 +136,123 @@ def test_failed_post_change_health_immediately_rolls_back(tmp_path, monkeypatch)
         session.commit()
         outcome = rewrites.set_rewrite(session, target, "192.0.2.2", "test candidate")
         assert outcome["rolled_back"] and client.ip == "192.0.2.1"
+        assert outcome["verified_current_ip"] == client.ip
         state = session.get(OptimizerStateRecord, target.id)
         assert state and state.current_rewrite_ip == "192.0.2.1"
         history = list(session.scalars(select(RewriteHistoryRecord).order_by(RewriteHistoryRecord.id)))
         assert [item.new_ip for item in history] == ["192.0.2.2", "192.0.2.1"]
         assert session.scalar(select(AuditLogRecord.event).where(AuditLogRecord.event == "rewrite_rollback"))
+    db.close()
+
+
+def test_successful_rewrite_updates_existing_and_verifies_before_persisting(tmp_path, monkeypatch):
+    db = Database(f"sqlite:///{(tmp_path / 'rewrite-success.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    class FakeAdGuard:
+        ip = "192.0.2.1"
+        updates = 0
+        adds = 0
+
+        def get_rewrite(self, _host): return {"answer": self.ip}
+        def update_rewrite(self, _old_host, old_ip, _host, ip):
+            assert self.ip == old_ip
+            self.updates += 1
+            self.ip = ip
+        def add_rewrite(self, _host, ip): self.adds += 1; self.ip = ip
+        def delete_rewrite(self, _host, _ip): self.ip = None
+        def close(self): pass
+
+    client = FakeAdGuard()
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: client)
+    monkeypatch.setattr(rewrites, "_healthy", lambda _target, _ip: True)
+    with db.session_factory() as session:
+        target = save_target(session, Target(hostname="manual-apply.example"))
+        session.commit()
+        result = rewrites.set_rewrite(session, target, "192.0.2.2", "Manual Apply Best IP")
+        assert result["healthy"] and result["changed"]
+        assert result["verified_current_ip"] == client.ip == "192.0.2.2"
+        assert client.ip == "192.0.2.2" and client.updates == 1 and client.adds == 0
+        history = session.scalar(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target.id))
+        assert history and history.old_ip == "192.0.2.1" and history.new_ip == "192.0.2.2"
+        assert session.scalar(select(AuditLogRecord.event).where(
+            AuditLogRecord.target_id == target.id, AuditLogRecord.event == "rewrite_applied"))
+    db.close()
+
+
+def test_adguard_http_update_failure_does_not_persist_false_rewrite_history(tmp_path, monkeypatch):
+    db = Database(f"sqlite:///{(tmp_path / 'rewrite-http-failure.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    def handler(request):
+        if request.method == "GET" and request.url.path.endswith("rewrite/list"):
+            return httpx.Response(200, json=[{"domain": "http-failure.example", "answer": "192.0.2.1"}])
+        if request.method == "PUT" and request.url.path.endswith("rewrite/update"):
+            return httpx.Response(500, json={"error": "write failed"})
+        return httpx.Response(200, json={"ok": True})
+
+    client = AdGuardClient("http://adguard", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: client)
+    with db.session_factory() as session:
+        target = save_target(session, Target(hostname="http-failure.example"))
+        session.commit()
+        with pytest.raises(AdGuardError, match="PUT rewrite/update failed"):
+            rewrites.set_rewrite(session, target, "192.0.2.2", "Manual Apply Best IP")
+        assert session.scalar(select(RewriteHistoryRecord.id)) is None
+        assert session.scalar(select(AuditLogRecord.event).where(
+            AuditLogRecord.event == "rewrite_applied")) is None
+    db.close()
+
+
+def test_duplicate_rewrite_is_rejected_without_adding_or_updating(tmp_path, monkeypatch):
+    from app.integrations.adguard import AdGuardError
+
+    db = Database(f"sqlite:///{(tmp_path / 'rewrite-duplicates.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    class DuplicateAdGuard:
+        writes = 0
+        def get_rewrite(self, _host): raise AdGuardError("multiple rewrites for domain")
+        def update_rewrite(self, *_args): self.writes += 1
+        def add_rewrite(self, *_args): self.writes += 1
+        def close(self): pass
+
+    client = DuplicateAdGuard()
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: client)
+    with db.session_factory() as session:
+        target = save_target(session, Target(hostname="duplicate.example"))
+        session.commit()
+        with pytest.raises(AdGuardError, match="multiple rewrites"):
+            rewrites.set_rewrite(session, target, "192.0.2.2", "Manual Apply Best IP")
+        assert client.writes == 0
+        assert session.scalar(select(RewriteHistoryRecord.id)) is None
+    db.close()
+
+
+def test_manual_apply_rejects_rewrite_changed_since_benchmark(tmp_path, monkeypatch):
+    from app.integrations.adguard import AdGuardError
+
+    db = Database(f"sqlite:///{(tmp_path / 'rewrite-stale.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    class FakeAdGuard:
+        writes = 0
+        def get_rewrite(self, _host): return {"answer": "192.0.2.9"}
+        def update_rewrite(self, *_args): self.writes += 1
+        def add_rewrite(self, *_args): self.writes += 1
+        def close(self): pass
+
+    client = FakeAdGuard()
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: client)
+    with db.session_factory() as session:
+        target = save_target(session, Target(hostname="stale-rewrite.example"))
+        session.commit()
+        with pytest.raises(AdGuardError, match="changed since the benchmark"):
+            rewrites.set_rewrite(session, target, "192.0.2.2", "Manual Apply Best IP",
+                                 expected_old_ip="192.0.2.1")
+        assert client.writes == 0
+        assert session.scalar(select(RewriteHistoryRecord.id)) is None
     db.close()
 
 
@@ -190,7 +305,8 @@ def test_daily_auto_change_limit_falls_back_to_recommend(tmp_path, monkeypatch):
     Base.metadata.create_all(db.engine)
     monkeypatch.setattr(rewrites, "_adguard_client", lambda: pytest.fail("must not write DNS"))
     with db.session() as session:
-        target = save_target(session, Target(hostname="limited.example", mode="auto"))
+        target = save_target(session, Target(hostname="limited.example", mode="auto", auto_apply=True))
+        set_setting(session, "global_auto_master", "true")
         set_setting(session, "max_auto_changes_per_day", "1")
         add_rewrite_history(session, target.id, "192.0.2.1", "192.0.2.2", "previous", automatic=True)
         output = rewrites.apply_automatic_decision(session, target, {
@@ -207,12 +323,41 @@ def test_locked_ip_blocks_automatic_rewrite(tmp_path, monkeypatch):
     Base.metadata.create_all(db.engine)
     monkeypatch.setattr(rewrites, "_adguard_client", lambda: pytest.fail("locked target cannot write DNS"))
     with db.session() as session:
-        target = save_target(session, Target(hostname="locked-auto.example", mode="auto",
+        target = save_target(session, Target(hostname="locked-auto.example", mode="auto", auto_apply=True,
                                              manual_lock_ip="192.0.2.1"))
+        set_setting(session, "global_auto_master", "true")
         result = rewrites.apply_automatic_decision(session, target, {
             "decision": {"action": "UPDATE", "candidate_ip": "192.0.2.2"}})
         assert result["rewrite_applied"] is False
         assert "manual IP lock" in result["reason"]
+    db.close()
+
+
+@pytest.mark.parametrize(("master", "target_opt_in", "should_write"), [
+    (False, True, False),
+    (True, False, False),
+    (True, True, True),
+])
+def test_automatic_rewrite_requires_global_and_per_target_opt_in(
+        tmp_path, monkeypatch, master, target_opt_in, should_write):
+    db = Database(f"sqlite:///{(tmp_path / f'auto-{master}-{target_opt_in}.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+    writes = []
+    monkeypatch.setattr(rewrites, "set_rewrite", lambda *_args, **_kwargs:
+                        writes.append(True) or {"changed": True, "healthy": True})
+    with db.session() as session:
+        target = save_target(session, Target(hostname="dual-gate.example", mode="auto",
+                                             auto_apply=target_opt_in))
+        if master:
+            set_setting(session, "global_auto_master", "true")
+        result = rewrites.apply_automatic_decision(session, target, {
+            "decision": {"action": "UPDATE", "candidate_ip": "192.0.2.9", "reason": "safe win"}})
+        assert bool(writes) is should_write
+        assert result["rewrite_applied"] is should_write
+        if not should_write:
+            assert result["change_limited"] is False
+            assert session.scalar(select(AuditLogRecord.event).where(
+                AuditLogRecord.event == "auto_change_blocked"))
     db.close()
 
 
@@ -260,7 +405,7 @@ def test_log_retention_removes_only_old_rotated_files(tmp_path):
         cleanup_rotated_logs(active, 0, now)
 
 
-def test_retention_deletes_samples_and_old_runs_but_keeps_rewrite_history(tmp_path):
+def test_retention_deletes_old_benchmark_trees_and_keeps_rewrite_history(tmp_path):
     db = Database(f"sqlite:///{(tmp_path / 'retention.db').as_posix()}")
     Base.metadata.create_all(db.engine)
     now = datetime.now(timezone.utc)
@@ -287,10 +432,40 @@ def test_retention_deletes_samples_and_old_runs_but_keeps_rewrite_history(tmp_pa
         session.add(BenchmarkSampleRecord(result_id=recent_result.id, run_number=1,
                                           created_at=now - timedelta(days=2)))
         result_counts = cleanup_retention(session, now)
-        assert result_counts == {"samples_deleted": 1, "runs_deleted": 1}
+        assert result_counts == {"samples_deleted": 1, "results_deleted": 1, "runs_deleted": 1}
         assert session.get(RewriteHistoryRecord, history_id) is not None
         assert session.get(BenchmarkRunRecord, recent_run.id) is not None
         assert session.scalar(select(BenchmarkSampleRecord.id)) is not None
+    db.close()
+
+
+def test_default_72_hour_retention_cleans_old_run_tree_and_preserves_fk_integrity(tmp_path):
+    db = Database(f"sqlite:///{(tmp_path / 'retention-72h.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+    now = datetime.now(timezone.utc)
+    with db.session() as session:
+        assert configured_benchmark_history_retention(session) == (72, "hours")
+        assert benchmark_history_retention(session) == timedelta(hours=72)
+        target = save_target(session, Target(hostname="72hours.example"))
+        old = BenchmarkRunRecord(target_id=target.id, completed_at=now - timedelta(hours=73))
+        recent = BenchmarkRunRecord(target_id=target.id, completed_at=now - timedelta(hours=71))
+        session.add_all([old, recent])
+        session.flush()
+        old_result = BenchmarkResultRecord(run_id=old.id, ip="192.0.2.10", valid_runs=1,
+                                           requested_runs=1, healthy=False)
+        recent_result = BenchmarkResultRecord(run_id=recent.id, ip="192.0.2.11", valid_runs=1,
+                                              requested_runs=1, healthy=True)
+        session.add_all([old_result, recent_result])
+        session.flush()
+        session.add_all([BenchmarkSampleRecord(result_id=old_result.id, run_number=1),
+                         BenchmarkSampleRecord(result_id=recent_result.id, run_number=1)])
+        result = cleanup_retention(session, now)
+        assert result == {"samples_deleted": 1, "results_deleted": 1, "runs_deleted": 1}
+        assert session.get(BenchmarkRunRecord, old.id) is None
+        assert session.get(BenchmarkRunRecord, recent.id) is not None
+        assert session.scalar(select(BenchmarkSampleRecord.id).where(
+            BenchmarkSampleRecord.result_id == recent_result.id)) is not None
+        assert session.execute(text("PRAGMA foreign_key_check")).all() == []
     db.close()
 
 

@@ -68,25 +68,24 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
     finally:
         discovery.close()
 
-    current_ip, lookup_succeeded = read_adguard_rewrite(config.hostname)
+    resolved_current_ip, lookup_succeeded = read_adguard_rewrite(config.hostname)
     if not lookup_succeeded:
-        current_ip = stored_current_ip
+        resolved_current_ip = stored_current_ip
+    resolution_failed = not public_ips
+    if resolution_failed and not discovery_error:
+        logger.warning("Public DNS discovery returned no valid IPv4 records host=%s", config.hostname)
+    current_ip = None if resolution_failed else resolved_current_ip
     current_rewrite_in_public_dns = bool(current_ip and current_ip in public_ips)
-    candidate_ips = list(dict.fromkeys(
+    candidate_ips = [] if resolution_failed else list(dict.fromkeys(
         [*public_ips, *([current_ip] if current_ip else []),
          *([config.manual_lock_ip] if config.manual_lock_ip else [])]
     ))
     results = []
-    if discovery_error:
-        decision = DecisionResult(
-            action="LOCKED" if config.manual_lock_ip else "KEEP",
-            current_ip=current_ip, candidate_ip=config.manual_lock_ip,
-            reason=("Manual lock is active; automatic rewrite is disabled." if config.manual_lock_ip
-                    else "Public DNS discovery failed; current rewrite retained."),
-        )
-    elif not candidate_ips:
-        decision = DecisionResult(action="KEEP", current_ip=current_ip,
-                                  reason="No public IPv4 candidates or current rewrite are available.")
+    if resolution_failed:
+        reason = "Public DNS discovery failed or returned no valid IP."
+        if not discovery_error:
+            discovery_error = "No valid public IPv4 A records were returned."
+        decision = DecisionResult(action="RESOLUTION_FAILED", reason=reason)
     else:
         results = HttpsBenchmarkRunner(config.runs_per_ip, config.timeout_seconds).benchmark(
             config.hostname, candidate_ips, path=config.path, port=config.port)
@@ -104,12 +103,14 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
     summary = {"current_rewrite_ip": current_ip,
                "public_ips": public_ips,
                "candidate_ips": candidate_ips,
+               "resolution_failed": resolution_failed,
                "current_rewrite_included": bool(current_ip and current_ip in candidate_ips),
                "current_rewrite_in_public_dns": current_rewrite_in_public_dns,
+               "current_rewrite_lookup_succeeded": bool(lookup_succeeded and not resolution_failed),
                "candidate_count": len(results), "discovery_error": discovery_error}
     with session.begin_nested():
         run = save_benchmark_run(session, record.id, results, summary=summary, decision=decision)
-        save_optimizer_state(session, record.id, current_ip, next_pending, decision)
+        save_optimizer_state(session, record.id, resolved_current_ip, next_pending, decision)
         add_audit_event(session, "benchmark_completed", record.id,
                         {**summary, "decision_action": decision.action, "decision_reason": decision.reason})
     return {"hostname": config.hostname, "current_ip": current_ip,

@@ -14,6 +14,7 @@ class Target(BaseModel):
 
     hostname: str
     enabled: bool = True
+    auto_apply: bool = False
     protocol: Literal["https"] = "https"
     port: int = Field(default=443, ge=1, le=65535)
     path: str = "/"

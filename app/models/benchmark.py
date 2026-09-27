@@ -46,7 +46,7 @@ class BenchmarkResult(BaseModel):
 class DecisionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["KEEP", "HOLD", "UPDATE", "FAILOVER", "LOCKED"]
+    action: Literal["KEEP", "HOLD", "UPDATE", "FAILOVER", "LOCKED", "RESOLUTION_FAILED"]
     current_ip: str | None = None
     candidate_ip: str | None = None
     reason: str

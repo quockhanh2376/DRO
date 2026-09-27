@@ -41,9 +41,25 @@ def _healthy(target: Target, ip: str) -> bool:
     return result.healthy
 
 
+def _rewrite_is(client: AdGuardClient, hostname: str, ip: str | None) -> bool:
+    current = client.get_rewrite(hostname)
+    return (current.get("answer") if current else None) == ip
+
+
+def _restore_rewrite(client: AdGuardClient, hostname: str,
+                     old_ip: str | None) -> tuple[bool, str | None]:
+    current = client.get_rewrite(hostname)
+    current_ip = current.get("answer") if current else None
+    if current_ip != old_ip:
+        _write(client, hostname, current_ip, old_ip)
+    restored = client.get_rewrite(hostname)
+    verified_ip = restored.get("answer") if restored else None
+    return verified_ip == old_ip, verified_ip
+
+
 def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                 reason: str, benchmark_run_id: int | None = None,
-                automatic: bool = False) -> dict:
+                automatic: bool = False, expected_old_ip: str | None = None) -> dict:
     """Write a rewrite, verify it from this host, and immediately restore on failed health."""
     target = Target.model_validate(record, from_attributes=True)
     client = _adguard_client()
@@ -52,8 +68,11 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
     try:
         existing = client.get_rewrite(target.hostname)
         old_ip = existing.get("answer") if existing else None
+        if expected_old_ip is not None and old_ip != expected_old_ip:
+            raise AdGuardError("AdGuard rewrite changed since the benchmark")
         if old_ip == new_ip:
-            return {"changed": False, "old_ip": old_ip, "new_ip": new_ip, "healthy": True}
+            return {"changed": False, "old_ip": old_ip, "new_ip": new_ip,
+                    "verified_current_ip": old_ip, "healthy": True}
 
         # Commit an audit intent before the external mutation, so a broken database prevents DNS changes.
         add_audit_event(session, "rewrite_change_started", record.id,
@@ -61,7 +80,8 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
         session.commit()
         mutation_started = True
         _write(client, target.hostname, old_ip, new_ip)
-        healthy = new_ip is None or _healthy(target, new_ip)
+        rewrite_verified = _rewrite_is(client, target.hostname, new_ip)
+        healthy = rewrite_verified and (new_ip is None or _healthy(target, new_ip))
         if healthy:
             add_rewrite_history(session, record.id, old_ip, new_ip, reason,
                                 benchmark_run_id, automatic=automatic)
@@ -74,9 +94,10 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                             {"old_ip": old_ip, "new_ip": new_ip, "reason": reason,
                              "automatic": automatic, "healthy": healthy})
             session.commit()
-            return {"changed": True, "old_ip": old_ip, "new_ip": new_ip, "healthy": healthy}
+            return {"changed": True, "old_ip": old_ip, "new_ip": new_ip,
+                    "verified_current_ip": new_ip, "healthy": healthy}
 
-        _write(client, target.hostname, new_ip, old_ip)
+        restored, verified_current_ip = _restore_rewrite(client, target.hostname, old_ip)
         mutation_started = False
         add_rewrite_history(session, record.id, old_ip, new_ip,
                             f"{reason}; immediate health check failed", benchmark_run_id,
@@ -88,12 +109,14 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
         if state is None:
             state = OptimizerStateRecord(target_id=record.id)
             session.add(state)
-        state.current_rewrite_ip = old_ip
+        state.current_rewrite_ip = verified_current_ip
         add_audit_event(session, "rewrite_rollback", record.id,
-                        {"failed_ip": new_ip, "restored_ip": old_ip, "health_check": "failed"})
+                        {"failed_ip": new_ip, "restored_ip": verified_current_ip, "health_check": "failed",
+                         "restored": restored})
         session.commit()
         logger.warning("Rewrite rolled back host=%s failed_ip=%s", target.hostname, new_ip)
-        return {"changed": True, "rolled_back": True, "old_ip": old_ip,
+        return {"changed": True, "rolled_back": restored, "old_ip": old_ip,
+                "verified_current_ip": verified_current_ip,
                 "new_ip": new_ip, "healthy": False}
     except Exception:
         try:
@@ -103,7 +126,7 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                          target.hostname, type(database_rollback_error).__name__)
         if mutation_started:
             try:
-                _write(client, target.hostname, new_ip, old_ip)
+                _restore_rewrite(client, target.hostname, old_ip)
             except Exception as rollback_error:
                 logger.critical("Compensating rewrite failed host=%s error=%s",
                                 target.hostname, type(rollback_error).__name__)
@@ -112,11 +135,25 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
         client.close()
 
 
+def automatic_rewrite_enabled(session: Session) -> bool:
+    return (get_setting(session, "global_auto_master") or "false").lower() == "true"
+
+
 def apply_automatic_decision(session: Session, record: TargetRecord, output: dict) -> dict:
-    """Apply UPDATE/FAILOVER decisions only for AUTO targets and within the daily limit."""
+    """Apply UPDATE/FAILOVER only when both global and per-target opt-ins are enabled."""
     decision = output.get("decision", {})
     if record.mode != "auto" or decision.get("action") not in {"UPDATE", "FAILOVER"}:
         return {"rewrite_applied": False}
+    if not automatic_rewrite_enabled(session):
+        reason = "Automatic DNS Rewrite master switch is OFF"
+        add_audit_event(session, "auto_change_blocked", record.id, {"reason": reason})
+        logger.info("Automatic rewrite blocked host=%s reason=global_master_off", record.hostname)
+        return {"rewrite_applied": False, "change_limited": False, "reason": reason}
+    if not record.auto_apply:
+        reason = "Auto Apply is OFF for this target"
+        add_audit_event(session, "auto_change_blocked", record.id, {"reason": reason})
+        logger.info("Automatic rewrite blocked host=%s reason=target_opt_in_off", record.hostname)
+        return {"rewrite_applied": False, "change_limited": False, "reason": reason}
     if record.manual_lock_ip:
         reason = "Automatic rewrite blocked by manual IP lock"
         add_audit_event(session, "auto_change_blocked", record.id, {"reason": reason})

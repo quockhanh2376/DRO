@@ -90,7 +90,9 @@ class AdGuardClient:
         return result
 
     def get_rewrite(self, domain: str) -> dict[str, Any] | None:
-        matches = [item for item in self.list_rewrites() if item["domain"] == domain]
+        normalized_domain = domain.rstrip(".").casefold()
+        matches = [item for item in self.list_rewrites()
+                   if item["domain"].rstrip(".").casefold() == normalized_domain]
         if len(matches) > 1:
             raise AdGuardError("AdGuard API returned multiple rewrites for the same domain")
         return matches[0] if matches else None
@@ -99,9 +101,9 @@ class AdGuardClient:
         return self._request("POST", "rewrite/add", json={"domain": domain, "answer": answer})
 
     def update_rewrite(self, old_domain: str, old_answer: str, domain: str, answer: str) -> Any:
-        result = self._request("POST", "rewrite/update", json={
+        result = self._request("PUT", "rewrite/update", json={
             "target": {"domain": old_domain, "answer": old_answer},
-            "update": {"domain": domain, "answer": answer},
+            "update": {"domain": domain, "answer": answer, "enabled": True},
         })
         return result
 

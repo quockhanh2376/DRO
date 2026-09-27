@@ -142,7 +142,8 @@ def add_audit_event(session: Session, event: str, target_id: int | None = None,
 
 def list_benchmark_runs(session: Session, target_id: int) -> list[BenchmarkRunRecord]:
     return list(session.scalars(select(BenchmarkRunRecord).where(BenchmarkRunRecord.target_id == target_id)
-                                .order_by(BenchmarkRunRecord.completed_at.desc())).all())
+                                .order_by(BenchmarkRunRecord.completed_at.desc(),
+                                          BenchmarkRunRecord.id.desc())).all())
 
 
 def get_benchmark_run(session: Session, run_id: int) -> BenchmarkRunRecord | None:

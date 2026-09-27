@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -35,3 +36,10 @@ def test_installer_python_version_check(tmp_path, version, supported):
     )
 
     assert (result.returncode == 0) is supported
+
+
+def test_systemd_service_trusts_only_loopback_proxy_and_stays_loopback_bound():
+    unit = Path(__file__).resolve().parents[1] / "systemd" / "dro.service.in"
+    content = unit.read_text(encoding="utf-8")
+    assert "--host 127.0.0.1" in content
+    assert "--proxy-headers --forwarded-allow-ips=127.0.0.1" in content

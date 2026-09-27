@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from app.core.benchmark import calculate_statistics
+from app.core.diagnostics import ping_ipv4
 from app.core.decision import DecisionEngine, rank_candidates
 from app.core.discovery import DiscoveryError, PublicDnsDiscovery
 from app.integrations.adguard import (
@@ -33,9 +34,12 @@ def result(ip: str, avg: float, healthy: bool = True, median: float | None = Non
 def test_target_defaults_and_validation():
     target = Target(hostname="Example.COM")
     assert target.hostname == "example.com"
+    assert target.auto_apply is False
     assert (target.interval_hours, target.runs_per_ip, target.switch_threshold_ms,
             target.switch_threshold_percent, target.required_consecutive_wins) == (2, 10, 50, 5, 2)
-    for kwargs in ({"hostname": "bad host"}, {"hostname": "127.0.0.1"}, {"hostname": "localhost"},
+    for kwargs in ({"hostname": "bad host"}, {"hostname": "https://example.com"},
+                   {"hostname": "example.com/path"}, {"hostname": "bad_name.example"},
+                   {"hostname": "127.0.0.1"}, {"hostname": "localhost"},
                    {"hostname": "x.com", "port": 65536}, {"hostname": "x.com", "runs_per_ip": 0},
                    {"hostname": "x.com", "timeout_seconds": 0},
                    {"hostname": "x.com", "switch_threshold_percent": 101}):
@@ -121,7 +125,54 @@ def test_adguard_mocked_api_operations():
     adguard.update_rewrite("a.com", "1.1.1.1", "a.com", "2.2.2.2")
     adguard.delete_rewrite("a.com", "2.2.2.2")
     assert len(calls) == 5
+    update = next(request for request in calls if request.url.path.endswith("rewrite/update"))
+    assert update.method == "PUT"
+    assert json.loads(update.content) == {
+        "target": {"domain": "a.com", "answer": "1.1.1.1"},
+        "update": {"domain": "a.com", "answer": "2.2.2.2", "enabled": True},
+    }
+    assert not any(request.method == "POST" and request.url.path.endswith("rewrite/update")
+                   for request in calls)
     assert "secret" not in repr(adguard)
+
+
+def test_adguard_rewrite_lookup_normalizes_hostname():
+    client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(
+        200, json=[{"domain": "Service.Example.com.", "answer": "192.0.2.186"}])))
+    adguard = AdGuardClient("http://adguard", client=client)
+    assert adguard.get_rewrite("service.example.com")["answer"] == "192.0.2.186"
+
+
+def test_ping_ipv4_validates_and_parses_linux_output(monkeypatch):
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0,
+            "4 packets transmitted, 4 received, 0% packet loss\\nrtt min/avg/max/mdev = 1.2/2.3/4.5/0.6 ms\\n", "")
+
+    monkeypatch.setattr("app.core.diagnostics.subprocess.run", run)
+    result = ping_ipv4("192.0.2.4")
+    assert result.status == "OK" and result.packet_loss_percent == 0
+    assert (result.min_ms, result.avg_ms, result.max_ms, result.mdev_ms) == (1.2, 2.3, 4.5, 0.6)
+    assert calls[0][0] == ["ping", "-c", "4", "-W", "1", "192.0.2.4"]
+    assert calls[0][1]["timeout"] == 8 and calls[0][1]["capture_output"] is True
+    assert "shell" not in calls[0][1]
+
+    monkeypatch.setattr("app.core.diagnostics.subprocess.run", lambda args, **_kwargs:
+                        subprocess.CompletedProcess(args, 1,
+                            "4 packets transmitted, 2 received, 50% packet loss\\n"
+                            "rtt min/avg/max/mdev = 2.0/3.0/4.0/0.5 ms\\n", ""))
+    assert ping_ipv4("192.0.2.4").status == "Warning"
+
+
+def test_ping_ipv4_rejects_invalid_or_ipv6_before_subprocess(monkeypatch):
+    monkeypatch.setattr("app.core.diagnostics.subprocess.run",
+                        lambda *_args, **_kwargs: pytest.fail("invalid IP must not be pinged"))
+    with pytest.raises(ValueError):
+        ping_ipv4("not-an-ip")
+    with pytest.raises(ValueError, match="IPv4"):
+        ping_ipv4("2001:db8::1")
 
 
 @pytest.mark.parametrize("endpoints", [[], ["http://one", "http://two"], ["http://one"]])

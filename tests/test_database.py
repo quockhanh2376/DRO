@@ -107,6 +107,10 @@ def test_initial_alembic_upgrade_downgrade_upgrade(tmp_path, monkeypatch):
     columns = {column["name"] for table in table_names for column in inspect(engine_db.engine).get_columns(table)}
     assert "password" not in columns
     assert "password_hash" in columns
+    target_columns = {column["name"]: column
+                      for column in inspect(engine_db.engine).get_columns("targets")}
+    assert target_columns["auto_apply"]["nullable"] is False
+    assert target_columns["auto_apply"]["default"] in ("0", "false", "FALSE")
     indexes = {index["name"] for table in ("benchmark_runs", "rewrite_history")
                for index in inspect(engine_db.engine).get_indexes(table)}
     assert {"ix_benchmark_runs_target_completed", "ix_rewrite_history_target_created"} <= indexes

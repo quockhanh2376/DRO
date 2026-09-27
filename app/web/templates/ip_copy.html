@@ -1,0 +1,1 @@
+{% if ip_value %}<span class="ip-copy-value">{{ ip_value }}<button class="copy-button" type="button" data-copy="{{ ip_value }}" data-copy-title="Copy IP" title="Copy IP" aria-label="Copy IP"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8V4h12v12h-4M4 8h12v12H4z"/></svg></button></span>{% else %}{{ unavailable|default("Unavailable") }}{% endif %}

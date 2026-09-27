@@ -46,9 +46,11 @@ The web pages and API require login except `/login`, `/health`, and `/api/v1/sys
 
 ## Current Production State (2026-09-27)
 
-DRO is deployed on `172.16.10.9` at `/opt/dro`, with database `/var/lib/dro/dro.db`, secrets in `/etc/dro/dro.env` (`root:root`, mode `600`), service `dro.service`, and HTTP port `18081`. The authenticated UI is at [http://172.16.10.9:18081](http://172.16.10.9:18081); AdGuard Home is at [http://172.16.10.9](http://172.16.10.9), and DRO accesses its API at `http://127.0.0.1`. The deployed database is at Alembic revision `0005_fractional_intervals`. Production currently listens on `0.0.0.0:18081` over HTTP; HTTPS proxying and rebinding Uvicorn to localhost remain planned.
+DRO release candidate `v1.0.0-rc.1` is deployed on `172.16.10.9` at `/opt/dro`, with database `/var/lib/dro/dro.db`, secrets in `/etc/dro/dro.env` (`root:root`, mode `600`), service `dro.service`, and backend `127.0.0.1:18081`. The authenticated UI is at [https://dro.aswigsyd.int](https://dro.aswigsyd.int); AdGuard Home is at [https://adguard10.aswigsyd.int](https://adguard10.aswigsyd.int), and DRO accesses the AdGuard API internally at `http://127.0.0.1:3001`. Nginx terminates TLS on port 443 and proxies by hostname. Uvicorn trusts forwarded proxy headers only from loopback, remains bound to loopback, and production sets `DRO_HTTPS_ENABLED=true` for Secure session cookies. Host and service timezone is `Asia/Ho_Chi_Minh`; UI timestamps are displayed in ICT while SQLite timestamps remain UTC. The deployed database schema is managed by Alembic.
 
-The scheduler is currently disabled; absent saved overrides, the default interval is two hours and log retention is seven days. Per-target intervals continue to govern scheduled runs when enabled. Benchmark samples are retained 30 days, benchmark runs 180 days, and rewrite history indefinitely. The latest deployment includes the HTMX inline Run Now result and editable default interval, scheduler, and log-retention settings. The legacy `dns-optimizer.timer` is disabled, while `/opt/dns-optimizer` remains available for rollback.
+Production currently has the scheduler enabled, a 60-minute default interval, 5-day application log retention, benchmark-history retention of 72 hours, and a five-per-day automatic rewrite limit. Per-target intervals govern scheduled runs. The global Automatic DNS Rewrite gate and per-target Auto Apply are enabled for the two configured targets; existing safety rules still apply. Benchmark runs, aggregate results, and samples are retained together for the configured history period; Runtime Settings allows an hours/days override. Rewrite history is retained indefinitely. The deployment includes the HTMX inline Run Now result, verified Apply Best IP action, and editable interval, scheduler, and retention settings. Manual Run Now benchmarks remain read-only. The legacy `dns-optimizer.timer` is disabled, while `/opt/dns-optimizer` remains available for rollback.
+
+Nginx must forward `Host $host`, `X-Forwarded-Host $host`, and `X-Forwarded-Proto $scheme`. Uvicorn accepts proxy headers only from `127.0.0.1`; keep the backend listener loopback-only. Set `DRO_HTTPS_ENABLED=true` in `/etc/dro/dro.env` so session cookies are Secure.
 
 ## Ubuntu service installation
 
@@ -66,7 +68,7 @@ The installer template binds to `127.0.0.1:8000`; use an HTTPS reverse proxy for
 
 ## Scheduler, locks, and DNS changes
 
-The scheduler is disabled until an admin enables it in **Settings**. Each enabled target uses its `interval_hours`; Run Now uses the same per-target concurrency guard. Scheduler last/next run times are persisted. The guard is process-local; run one DRO service instance.
+The scheduler is disabled until an admin enables it in **Runtime Settings** on Dashboard. Each enabled target uses its `interval_hours`; Run Now uses the same per-target concurrency guard. Scheduler last/next run times are persisted. The guard is process-local; run one DRO service instance.
 
 Targets in `monitor` and `recommend` mode never write DNS. In `auto` mode, qualified `UPDATE` or `FAILOVER` decisions may write a rewrite unless an IP is manually locked or the default cap of four automatic rewrites in the previous 24 hours is reached. The daily cap is configurable in Settings. Every automatic change gets an immediate three-run health check; DRO restores the previous rewrite if it fails. Manual rollback also checks the restored address. Locking can use the live current rewrite or a specified IPv4 address; locked targets continue to benchmark.
 
@@ -87,7 +89,7 @@ sudo -u dro /opt/dro/.venv/bin/dro db restore /var/lib/dro/backups/dro-YYYY-MM-D
 sudo systemctl start dro.service
 ```
 
-Restore stages and validates the SQLite file before replacing the live database. Keep backups outside the repository and restrict their permissions. Samples expire after 30 days, benchmark runs after 180 days, and rewrite history is retained indefinitely. `dro cleanup` runs the same cleanup immediately.
+Restore stages and validates the SQLite file before replacing the live database. Keep backups outside the repository and restrict their permissions. Benchmark runs, results, and samples expire together after the configurable history retention (72 hours by default); rewrite history is retained indefinitely. `dro cleanup` runs the same cleanup immediately.
 
 ## CLI
 
