@@ -690,7 +690,9 @@ def test_add_to_dns_unavailable_current_best_healthy_is_visible_in_both_paths(we
     monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
     page = client.get("/targets").text if path_kind == "inline" else client.get(f"/targets/{target_id}").text
     assert "Unavailable" in page
-    assert ">Add to DNS</button>" in page
+    title_group = page.split('class="benchmark-result-top"', 1)[1].split('class="benchmark-result-ip"', 1)[0]
+    assert title_group.index('class="benchmark-hostname"') < title_group.index('class="add-to-dns-form"')
+    assert title_group.index('class="add-to-dns-form"') < title_group.index(">Add to DNS</button>")
 
 
 def test_existing_rewrite_hides_add_and_synchronizes_from_targets_inline(web, monkeypatch):
