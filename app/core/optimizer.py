@@ -23,6 +23,13 @@ from app.models.target import Target
 logger = logging.getLogger(__name__)
 
 
+def _failure_summary(results) -> str | None:
+    failures = [result.health_reason for result in results if not result.healthy and result.health_reason]
+    if not failures:
+        return None
+    return "; ".join(failures)
+
+
 def read_adguard_rewrite(hostname: str) -> tuple[str | None, bool]:
     """Return (IP, lookup_succeeded); never changes AdGuard state."""
     try:
@@ -116,7 +123,8 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
                "current_rewrite_lookup_succeeded": bool(lookup_succeeded and not resolution_failed),
                "candidate_count": len(results), "discovery_error": discovery_error,
                "candidate_health_reasons": {result.ip: result.health_reason for result in results
-                                            if result.health_reason}}
+                                            if result.health_reason},
+               "failure_summary": _failure_summary(results)}
     with session.begin_nested():
         run = save_benchmark_run(session, record.id, results, summary=summary, decision=decision)
         save_optimizer_state(session, record.id, resolved_current_ip, next_pending, decision)

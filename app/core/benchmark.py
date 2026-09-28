@@ -6,6 +6,7 @@ import os
 import logging
 import statistics
 import subprocess
+from collections import Counter
 from typing import Callable, Sequence
 
 from app.models.benchmark import BenchmarkResult, BenchmarkSample
@@ -23,10 +24,9 @@ def calculate_statistics(samples: Sequence[BenchmarkSample], requested_runs: int
     healthy = len(valid) >= 3 and len(valid) >= 0.8 * requested
     failed = [sample for sample in samples if not sample.valid]
     reasons = [_sample_failure_reason(sample) for sample in failed]
-    reason = None
-    if not healthy and reasons:
-        reason = max(dict.fromkeys(reasons), key=reasons.count)
-    elif not healthy:
+    counts = Counter(reasons)
+    reason = "; ".join(f"{count}x {label}" for label, count in counts.most_common()) if not healthy and counts else None
+    if not healthy and not reason:
         reason = "Insufficient valid HTTPS samples"
     return BenchmarkResult(
         ip=samples[0].ip if samples else "", samples=list(samples), valid_runs=len(valid),
@@ -41,19 +41,31 @@ def calculate_statistics(samples: Sequence[BenchmarkSample], requested_runs: int
 
 def _sample_failure_reason(sample: BenchmarkSample) -> str:
     if sample.http_status is not None and not 200 <= sample.http_status <= 399:
-        return f"HTTP {sample.http_status} outside accepted range 200-399"
+        if sample.http_status in (301, 302, 303, 307, 308):
+            return "redirect failure"
+        return f"HTTP {sample.http_status}"
     error = (sample.error or "").casefold()
-    if "certificate" in error or "ssl" in error or "tls" in error:
-        return "TLS verification failed"
     if "timed out" in error or "timeout" in error:
-        return "Connection timeout"
+        if any(token in error for token in ("while reading", "read timeout", "response timeout", "receiving data")):
+            return "read timeout"
+        if any(token in error for token in ("failed to connect", "connect timeout", "operation timed out")):
+            return "connect timeout"
+        return "read timeout"
     if "connection refused" in error:
-        return "Connection refused"
+        return "connection refused"
     if "connection reset" in error or "reset by peer" in error:
-        return "Connection reset"
-    if "could not resolve" in error or "resolve host" in error:
-        return "Hostname/SNI resolution failed"
-    return "No valid HTTPS response"
+        return "connection reset"
+    if any(token in error for token in ("no alternative certificate", "hostname mismatch", "does not match", "subject name")):
+        return "hostname/SNI mismatch"
+    if any(token in error for token in ("certificate", "cert verify", "unknown ca", "self-signed")):
+        return "TLS certificate verification failure"
+    if any(token in error for token in ("could not resolve", "resolve host", "name or service not known", "temporary failure in name resolution")):
+        return "DNS/resolve issue"
+    if "redirect" in error or "too many redirects" in error:
+        return "redirect failure"
+    if "http" in error or "curl:" in error:
+        return "other HTTP/client error"
+    return "other HTTP/client error"
 
 
 class HttpsBenchmarkRunner:
@@ -90,22 +102,20 @@ class HttpsBenchmarkRunner:
                 if not sample.valid:
                     sample.error = (f"HTTP {status} outside accepted range 200-399"
                                     if not 200 <= status <= 399 else "Missing HTTPS timing data")
-                    logger.info("Benchmark sample failed host=%s ip=%s run=%d reason=%s",
-                                hostname, ip, number, _sample_failure_reason(sample))
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 sample = BenchmarkSample(ip=ip, run_number=number, error=redact_secrets(exc))
                 detail = _sample_failure_reason(sample)
-                logger.info("Benchmark sample failed host=%s ip=%s run=%d reason=%s detail=%s",
-                            hostname, ip, number, detail, redact_secrets(exc))
+                logger.debug("Benchmark sample failed host=%s ip=%s run=%d category=%s",
+                             hostname, ip, number, detail)
             samples.append(sample)
         aggregate = calculate_statistics(samples, self.runs_per_ip)
-        logger.info("Benchmark finished host=%s ip=%s valid=%d/%d healthy=%s avg_ms=%s reason=%s",
+        logger.info("Benchmark finished host=%s ip=%s valid=%d/%d healthy=%s avg_ms=%s failure_summary=%s",
                     hostname, ip, aggregate.valid_runs, aggregate.requested_runs, aggregate.healthy,
-                    aggregate.average_ms, aggregate.health_reason or "healthy")
+                    aggregate.average_ms, aggregate.health_reason or "none")
         if not aggregate.healthy:
-            logger.warning("Unhealthy benchmark candidate host=%s ip=%s valid=%d/%d reason=%s",
+            logger.warning("Unhealthy benchmark candidate host=%s ip=%s valid=%d/%d healthy=%s failure_summary=%s",
                            hostname, ip, aggregate.valid_runs, aggregate.requested_runs,
-                           aggregate.health_reason)
+                           aggregate.healthy, aggregate.health_reason)
         return aggregate
 
     def _command(self, hostname: str, ip: str, path: str, port: int, skip_revocation: bool = False) -> list[str]:

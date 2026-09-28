@@ -172,3 +172,29 @@ def test_cycle_persistence_rolls_back_when_audit_write_fails(monkeypatch, tmp_pa
         assert session.scalar(select(func.count()).select_from(OptimizerStateRecord)) == 0
         assert session.scalar(select(func.count()).select_from(AuditLogRecord)) == 0
     db.close()
+
+
+def test_benchmark_run_persists_aggregated_candidate_failure_summaries(monkeypatch, tmp_path):
+    class Discovery:
+        def discover(self, _hostname): return ["113.171.12.192", "113.171.12.178"]
+        def close(self): pass
+
+    class Runner:
+        def __init__(self, *_args): pass
+        def benchmark(self, _hostname, ips, **_kwargs):
+            return [BenchmarkResult(ip=ip, healthy=False, valid_runs=0, requested_runs=10,
+                                    health_reason="10x HTTP 403") for ip in ips]
+
+    monkeypatch.setattr(optimizer, "PublicDnsDiscovery", Discovery)
+    monkeypatch.setattr(optimizer, "read_adguard_rewrite", lambda _host: (None, True))
+    monkeypatch.setattr(optimizer, "HttpsBenchmarkRunner", Runner)
+    db = Database(f"sqlite:///{(tmp_path / 'failure-summary.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+    with db.session() as session:
+        target = save_target(session, Target(hostname="www.ato.gov.au"))
+        output = optimizer.run_benchmark_cycle(session, target)
+        run = session.get(BenchmarkRunRecord, output["benchmark_run_id"])
+        assert run.summary["candidate_health_reasons"] == {
+            "113.171.12.192": "10x HTTP 403", "113.171.12.178": "10x HTTP 403"}
+        assert run.summary["failure_summary"] == "10x HTTP 403; 10x HTTP 403"
+    db.close()

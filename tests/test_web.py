@@ -202,7 +202,9 @@ def test_unhealthy_current_without_healthy_alternative_stays_critical_and_no_app
             "resolution_failed": False, "current_rewrite_ip": current.ip,
             "current_rewrite_lookup_succeeded": True,
             "public_ips": [failed.ip], "candidate_ips": [failed.ip, current.ip],
-            "candidate_health_reasons": {failed.ip: failed.health_reason, current.ip: current.health_reason},
+            "candidate_health_reasons": {failed.ip: "10x TLS certificate verification failure",
+                                         current.ip: "10x HTTP 403"},
+            "failure_summary": "10x TLS certificate verification failure; 10x HTTP 403",
         }, DecisionResult(action="KEEP", current_ip=current.ip,
                           reason="Current IP is unhealthy and no healthy alternative is available."))
         save_optimizer_state(session, target.id, current.ip, PendingCandidateState(),
@@ -216,8 +218,9 @@ def test_unhealthy_current_without_healthy_alternative_stays_critical_and_no_app
     detail = client.get(f"/targets/{target_id}").text
     dashboard = client.get("/").text
     assert "Current IP is unhealthy and no healthy alternative is available." in detail
-    assert "113.171.12.192" in detail and "TLS verification failed" in detail
-    assert "HTTP 403 outside accepted range 200-399" in detail
+    assert "113.171.12.192" in detail and "10x TLS certificate verification failure" in detail
+    assert "10x HTTP 403" in detail
+    assert "No healthy candidate: 10x TLS certificate verification failure; 10x HTTP 403." in detail
     assert ">Critical<" in dashboard
     assert "Best IP" in detail and "Apply Best IP" not in detail
     assert f'action="/targets/{target_id}/apply-best"' not in detail

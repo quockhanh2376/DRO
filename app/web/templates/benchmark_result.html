@@ -26,6 +26,7 @@
     {% endif %}</div>
   </div>
   {% if resolution_failed %}<div class="resolution-warning" role="alert">Unable to resolve this domain. Please double-check the hostname and try again.</div>{% endif %}
+  {% if not best and latest.summary.get('failure_summary') %}<p class="benchmark-no-healthy">No healthy candidate: {{ latest.summary.get('failure_summary') }}.</p>{% endif %}
   <div class="benchmark-result-details">
     <div class="benchmark-candidates">
       <h3>Discovered candidates</h3>
