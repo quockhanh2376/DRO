@@ -3,7 +3,6 @@
   {% set resolution_failed = latest.summary.get('resolution_failed', false) %}
   {% set current_ip = current_ip_override if current_ip_override is defined else latest.summary.get('current_rewrite_ip') %}
   {% set can_apply = not resolution_failed and latest.summary.get('current_rewrite_lookup_succeeded') and current_ip and best and best.healthy and current_ip != best.ip %}
-  {% set can_add = not resolution_failed and latest.summary.get('current_rewrite_lookup_succeeded') and rewrite_absent and best and best.healthy and best.ip %}
   <div class="benchmark-result-top">
     <h2>Benchmark result: <span class="benchmark-hostname">{{ target.hostname }}</span></h2>
     <div class="benchmark-result-ip"><span>Current IP:</span><strong>{% if resolution_failed %}<span class="unavailable-value">Unavailable</span>{% else %}{% set ip_value = current_ip %}{% include "ip_copy.html" %}{% endif %}</strong></div>
@@ -17,7 +16,7 @@
         <input type="hidden" name="confirm" value="true">
         <button class="button primary" type="submit">Apply Best IP</button>
       </form>
-    {% elif can_add %}
+    {% elif can_add_to_dns|default(false) %}
       <form method="post" action="/targets/{{ target.id }}/add-to-dns" class="apply-best-form" data-confirm="Add {{ target.hostname }} -> {{ best.ip }} to AdGuard DNS Rewrite?" onsubmit="return confirm(this.dataset.confirm)">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="run_id" value="{{ latest.id }}">

@@ -98,6 +98,49 @@ def _dashboard_rows(session: Session) -> list[dict]:
     return rows
 
 
+def _add_to_dns_eligibility(session: Session, target: TargetRecord, run=None) -> dict:
+    """Resolve Add to DNS visibility and synchronize any live existing rewrite."""
+    runs = list_benchmark_runs(session, target.id)
+    latest = get_benchmark_run(session, runs[0].id) if runs else None
+    if run is not None and (latest is None or latest.id != run.id):
+        return {"latest": latest, "best": _best_benchmark_result(latest), "can_add_to_dns": False}
+    latest = latest or run
+    best = _best_benchmark_result(latest)
+    if (not latest or not target.enabled or not best or not best.healthy or not best.ip
+            or best.average_ms is None):
+        return {"latest": latest, "best": best, "can_add_to_dns": False}
+    try:
+        best.ip = str(ipaddress.IPv4Address(best.ip))
+    except ipaddress.AddressValueError:
+        return {"latest": latest, "best": best, "can_add_to_dns": False}
+    age = datetime.now(timezone.utc) - latest.completed_at.replace(tzinfo=timezone.utc)
+    if age < timedelta(0) or age > ADD_BEST_MAX_AGE:
+        return {"latest": latest, "best": best, "can_add_to_dns": False}
+    try:
+        client = configured_adguard_client()
+        try:
+            existing = client.get_rewrite(target.hostname)
+        finally:
+            client.close()
+    except Exception as exc:
+        logger.warning("Add to DNS eligibility rewrite lookup failed target_id=%d error=%s",
+                       target.id, type(exc).__name__)
+        return {"latest": latest, "best": best, "can_add_to_dns": False}
+    if existing is not None:
+        try:
+            existing_ip = str(ipaddress.IPv4Address(existing["answer"]))
+        except (KeyError, ValueError):
+            existing_ip = None
+        state = session.get(OptimizerStateRecord, target.id)
+        if state is None:
+            state = OptimizerStateRecord(target_id=target.id)
+            session.add(state)
+        state.current_rewrite_ip = existing_ip
+        session.commit()
+        return {"latest": latest, "best": best, "can_add_to_dns": False}
+    return {"latest": latest, "best": best, "can_add_to_dns": True}
+
+
 def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, tuple]:
     if not targets:
         return {}
@@ -107,8 +150,12 @@ def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, 
         BenchmarkRunRecord.target_id.in_(target_ids)
     ).order_by(BenchmarkRunRecord.target_id, BenchmarkRunRecord.completed_at.desc(),
                BenchmarkRunRecord.id.desc())).all()
+    targets_by_id = {target.id: target for target in targets}
     for run in runs:
-        latest_runs.setdefault(run.target_id, (run, _best_benchmark_result(run)))
+        if run.target_id not in latest_runs:
+            target = targets_by_id[run.target_id]
+            eligibility = _add_to_dns_eligibility(session, target, run)
+            latest_runs[run.target_id] = (run, eligibility["best"], eligibility["can_add_to_dns"])
     return latest_runs
 
 
@@ -134,9 +181,10 @@ def run_state_page(target_id: int, request: Request, session: Session = Depends(
     run_status, queue_position = request.app.state.run_coordinator.state(target_id)
     runs = list_benchmark_runs(session, target_id)
     latest = get_benchmark_run(session, runs[0].id) if runs else None
+    eligibility = _add_to_dns_eligibility(session, target, latest)
     return templates.TemplateResponse(request, "run_state.html", _base_context(
         request, target=target, run_status=run_status, queue_position=queue_position,
-        latest=latest, best=_best_benchmark_result(latest)))
+        latest=latest, best=eligibility["best"], can_add_to_dns=eligibility["can_add_to_dns"]))
 
 
 @router.post("/targets/{target_id}/ping", response_class=HTMLResponse, name="ping_target_page",
@@ -317,24 +365,13 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
     state = session.get(OptimizerStateRecord, target_id)
     current = next((item for item in latest.results if state and item.ip == state.current_rewrite_ip), None) if latest else None
     best = _best_benchmark_result(latest)
-    rewrite_absent = False
-    if (latest and not (state and state.current_rewrite_ip)
-            and latest.summary.get("current_rewrite_lookup_succeeded")
-            and latest.summary.get("current_rewrite_ip") is None):
-        try:
-            rewrite_client = configured_adguard_client()
-            rewrite_absent = rewrite_client.get_rewrite(target.hostname) is None
-        except Exception:
-            rewrite_absent = False
-        finally:
-            if "rewrite_client" in locals():
-                rewrite_client.close()
+    eligibility = _add_to_dns_eligibility(session, target, latest)
     return templates.TemplateResponse(request, "target_detail.html", _base_context(
         request, target=target, latest=latest, state=state, current=current, best=best,
         current_ip_override=(state.current_rewrite_ip if state else
                              latest.summary.get("current_rewrite_ip") if latest else None),
         rewrite_result=request.query_params.get("rewrite"),
-        rewrite_absent=rewrite_absent,
+        can_add_to_dns=eligibility["can_add_to_dns"],
         runs=runs, rewrite_history=list_rewrite_history(session, target_id)))
 
 
@@ -362,9 +399,10 @@ def run_target_now(target_id: int, request: Request, session: Session = Depends(
     if request.headers.get("HX-Request", "").lower() == "true":
         runs = list_benchmark_runs(session, target_id)
         latest = get_benchmark_run(session, runs[0].id) if runs else None
+        eligibility = _add_to_dns_eligibility(session, target, latest)
         return templates.TemplateResponse(request, "run_state.html", _base_context(
             request, target=target, run_status=run_status, queue_position=queue_position,
-            latest=latest, best=_best_benchmark_result(latest)))
+            latest=latest, best=eligibility["best"], can_add_to_dns=eligibility["can_add_to_dns"]))
     return RedirectResponse(f"/targets/{target_id}", status_code=303)
 
 

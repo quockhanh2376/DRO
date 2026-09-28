@@ -52,7 +52,7 @@
         <td class="activity-cell"><span id="ping-start-indicator-{{ item.id }}" class="activity-spinner ping-spinner htmx-indicator" role="status" aria-label="Starting ping" title="Starting ping"></span><div id="ping-status-{{ item.id }}"></div><div id="run-state-poll-{{ item.id }}" hx-get="/targets/{{ item.id }}/run/state" hx-trigger="load, every 1s" hx-target="this" hx-swap="innerHTML" hx-sync="this:replace">{% if run_status == 'running' %}<span id="run-state-indicator-{{ item.id }}" class="activity-spinner benchmark-spinner" role="status" aria-label="Benchmark running" title="Benchmark running"></span>{% elif run_status == 'queued' %}<span class="queued-state" role="status">Queued #{{ queue_position }}</span>{% endif %}</div></td>
       </tr>
       <tr class="ping-row"><td colspan="8"><div id="ping-result-{{ item.id }}" aria-live="polite" hx-get="/targets/{{ item.id }}/ping/output" hx-trigger="load, every 1s" hx-target="this" hx-swap="innerHTML" hx-sync="this:replace"></div></td></tr>
-      {% set latest_pair = latest_runs.get(item.id) %}{% set latest = latest_pair[0] if latest_pair else None %}{% set best = latest_pair[1] if latest_pair else None %}
+      {% set latest_pair = latest_runs.get(item.id) %}{% set latest = latest_pair[0] if latest_pair else None %}{% set best = latest_pair[1] if latest_pair else None %}{% set can_add_to_dns = latest_pair[2] if latest_pair and latest_pair|length > 2 else false %}
       <tr class="run-result-row"><td colspan="8"><div id="run-result-{{ item.id }}" aria-live="polite">{% if latest %}{% include "benchmark_result.html" %}{% endif %}</div></td></tr>
     {% else %}<tr><td colspan="8" class="empty">No targets configured.</td></tr>{% endfor %}
     </tbody>

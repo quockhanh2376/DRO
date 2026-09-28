@@ -675,6 +675,57 @@ def test_add_to_dns_button_requires_absent_live_rewrite_and_healthy_best(web, mo
     assert "Add to DNS" not in client.get(f"/targets/{target_id}").text
 
 
+@pytest.mark.parametrize("path_kind", ["inline", "detail"])
+def test_add_to_dns_unavailable_current_best_healthy_is_visible_in_both_paths(web, monkeypatch, path_kind):
+    client, database = web
+    import app.web.routes as web_routes
+    target_id, run_id = _seed_add_dns_target(database)
+    with database.session() as session:
+        run = session.get(BenchmarkRunRecord, run_id)
+        run.summary["resolution_failed"] = True
+        run.summary["current_rewrite_lookup_succeeded"] = False
+    class FakeAdGuard:
+        def get_rewrite(self, _hostname): return None
+        def close(self): pass
+    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    page = client.get("/targets").text if path_kind == "inline" else client.get(f"/targets/{target_id}").text
+    assert "Unavailable" in page
+    assert ">Add to DNS</button>" in page
+
+
+def test_existing_rewrite_hides_add_and_synchronizes_from_targets_inline(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    target_id, _ = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        def get_rewrite(self, _hostname): return {"domain": "add-dns.example", "answer": "192.0.2.88"}
+        def close(self): pass
+    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    page = client.get("/targets").text
+    assert ">Add to DNS</button>" not in page
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.88"
+
+
+@pytest.mark.parametrize("healthy,stale", [(False, False), (True, True)])
+def test_add_to_dns_eligibility_hides_unhealthy_or_stale_in_both_pages(web, monkeypatch, healthy, stale):
+    client, database = web
+    import app.web.routes as web_routes
+    from datetime import timedelta
+    from app.db.models import BenchmarkRunRecord, utc_now
+    target_id, run_id = _seed_add_dns_target(database, healthy=healthy)
+    if stale:
+        with database.session() as session:
+            session.get(BenchmarkRunRecord, run_id).completed_at = utc_now() - timedelta(hours=2)
+    class FakeAdGuard:
+        def get_rewrite(self, _hostname): return None
+        def close(self): pass
+    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    for page in (client.get("/targets").text, client.get(f"/targets/{target_id}").text):
+        assert ">Add to DNS</button>" not in page
+
+
 def test_add_to_dns_creates_verifies_and_persists_once(web, monkeypatch):
     client, database = web
     import app.web.routes as web_routes
