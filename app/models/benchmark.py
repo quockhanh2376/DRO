@@ -37,6 +37,7 @@ class BenchmarkResult(BaseModel):
     min_ms: float | None = None
     max_ms: float | None = None
     jitter_ms: float | None = None
+    health_reason: str | None = None
 
     @property
     def avg_ms(self) -> float | None:

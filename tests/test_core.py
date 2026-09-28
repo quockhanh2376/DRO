@@ -59,6 +59,36 @@ def test_statistics_and_health_threshold():
     assert not calculate_statistics(samples[:7] + [BenchmarkSample(ip="1.2.3.4", run_number=8)] * 3, 10).healthy
 
 
+@pytest.mark.parametrize(("stderr", "expected"), [
+    ("curl: (28) Operation timed out", "Connection timeout"),
+    ("curl: (7) Failed to connect: Connection refused", "Connection refused"),
+    ("curl: (35) OpenSSL SSL_connect: certificate verify failed", "TLS verification failed"),
+    ("curl: (56) Recv failure: Connection reset by peer", "Connection reset"),
+])
+def test_benchmark_candidate_failure_reason_is_classified(stderr, expected):
+    result = calculate_statistics([BenchmarkSample(ip="203.0.113.20", run_number=1, error=stderr)], 1)
+    assert not result.healthy and result.health_reason == expected
+
+
+def test_benchmark_http_status_failure_keeps_actual_status_and_accepted_range():
+    sample = BenchmarkSample(ip="203.0.113.20", run_number=1, http_status=403,
+                             connect_ms=1, tls_ms=2, total_ms=3, error="HTTP 403 outside accepted range 200-399")
+    result = calculate_statistics([sample], 1)
+    assert sample.http_status == 403 and not sample.valid
+    assert result.health_reason == "HTTP 403 outside accepted range 200-399"
+
+
+def test_benchmark_runner_logs_candidate_and_sample_diagnostic(caplog):
+    response = subprocess.CompletedProcess([], 0,
+        stdout="403\t0.01\t0.03\t0.05", stderr="")
+    runner = benchmark_module.HttpsBenchmarkRunner(1, command_runner=lambda *_args, **_kwargs: response)
+    with caplog.at_level("INFO", logger="app.core.benchmark"):
+        result = runner.benchmark_ip("www.ato.gov.au", "113.171.12.192")
+    assert result.health_reason == "HTTP 403 outside accepted range 200-399"
+    assert "Benchmark sample failed host=www.ato.gov.au ip=113.171.12.192 run=1 reason=HTTP 403" in caplog.text
+    assert "accepted range 200-399" in caplog.text
+
+
 def test_statistics_edge_cases_do_not_require_pstdev_for_zero_or_one_sample(monkeypatch):
     one = BenchmarkSample(ip="1.2.3.4", run_number=1, http_status=200,
                           connect_ms=1, tls_ms=2, total_ms=3)

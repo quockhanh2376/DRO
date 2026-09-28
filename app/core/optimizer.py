@@ -77,6 +77,8 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
     if not lookup_succeeded:
         resolved_current_ip = stored_current_ip
     resolution_failed = not public_ips
+    logger.info("Benchmark DNS discovery host=%s candidates=%s current_rewrite_ip=%s",
+                config.hostname, public_ips, resolved_current_ip)
     if resolution_failed and not discovery_error:
         logger.warning("Public DNS discovery returned no valid IPv4 records host=%s", config.hostname)
     current_ip = None if resolution_failed else resolved_current_ip
@@ -112,7 +114,9 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
                "current_rewrite_included": bool(current_ip and current_ip in candidate_ips),
                "current_rewrite_in_public_dns": current_rewrite_in_public_dns,
                "current_rewrite_lookup_succeeded": bool(lookup_succeeded and not resolution_failed),
-               "candidate_count": len(results), "discovery_error": discovery_error}
+               "candidate_count": len(results), "discovery_error": discovery_error,
+               "candidate_health_reasons": {result.ip: result.health_reason for result in results
+                                            if result.health_reason}}
     with session.begin_nested():
         run = save_benchmark_run(session, record.id, results, summary=summary, decision=decision)
         save_optimizer_state(session, record.id, resolved_current_ip, next_pending, decision)

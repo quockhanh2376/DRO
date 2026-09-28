@@ -188,6 +188,42 @@ def test_unresolvable_valid_hostname_renders_diagnostic_state(web):
     assert ".resolution-warning{" in css and ".resolution-failed-badge{" in css
 
 
+def test_unhealthy_current_without_healthy_alternative_stays_critical_and_no_apply(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    hostname = "www.ato.gov.au"
+    with database.session() as session:
+        target = save_target(session, Target(hostname=hostname, mode="auto", auto_apply=True))
+        failed = BenchmarkResult(ip="113.171.12.192", healthy=False, valid_runs=0, requested_runs=10,
+                                 health_reason="TLS verification failed")
+        current = BenchmarkResult(ip="113.171.12.178", healthy=False, valid_runs=0, requested_runs=10,
+                                  health_reason="HTTP 403 outside accepted range 200-399")
+        save_benchmark_run(session, target.id, [failed, current], {
+            "resolution_failed": False, "current_rewrite_ip": current.ip,
+            "current_rewrite_lookup_succeeded": True,
+            "public_ips": [failed.ip], "candidate_ips": [failed.ip, current.ip],
+            "candidate_health_reasons": {failed.ip: failed.health_reason, current.ip: current.health_reason},
+        }, DecisionResult(action="KEEP", current_ip=current.ip,
+                          reason="Current IP is unhealthy and no healthy alternative is available."))
+        save_optimizer_state(session, target.id, current.ip, PendingCandidateState(),
+                             DecisionResult(action="KEEP", current_ip=current.ip,
+                                            reason="Current IP is unhealthy and no healthy alternative is available."))
+        target_id = target.id
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: type("Client", (), {
+        "get_rewrite": lambda _self, _host: {"domain": hostname, "answer": current.ip},
+        "close": lambda _self: None,
+    })())
+    detail = client.get(f"/targets/{target_id}").text
+    dashboard = client.get("/").text
+    assert "Current IP is unhealthy and no healthy alternative is available." in detail
+    assert "113.171.12.192" in detail and "TLS verification failed" in detail
+    assert "HTTP 403 outside accepted range 200-399" in detail
+    assert ">Critical<" in dashboard
+    assert "Best IP" in detail and "Apply Best IP" not in detail
+    assert f'action="/targets/{target_id}/apply-best"' not in detail
+    assert "Auto Apply" not in detail
+
+
 def test_global_and_target_auto_apply_controls_require_both_opt_ins(web):
     client, database = web
     settings = client.get("/").text

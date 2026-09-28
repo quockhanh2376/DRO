@@ -21,6 +21,13 @@ def calculate_statistics(samples: Sequence[BenchmarkSample], requested_runs: int
     times = [float(s.total_ms) for s in valid]
     requested = requested_runs if requested_runs is not None else len(samples)
     healthy = len(valid) >= 3 and len(valid) >= 0.8 * requested
+    failed = [sample for sample in samples if not sample.valid]
+    reasons = [_sample_failure_reason(sample) for sample in failed]
+    reason = None
+    if not healthy and reasons:
+        reason = max(dict.fromkeys(reasons), key=reasons.count)
+    elif not healthy:
+        reason = "Insufficient valid HTTPS samples"
     return BenchmarkResult(
         ip=samples[0].ip if samples else "", samples=list(samples), valid_runs=len(valid),
         requested_runs=requested, healthy=healthy,
@@ -28,7 +35,25 @@ def calculate_statistics(samples: Sequence[BenchmarkSample], requested_runs: int
         median_ms=statistics.median(times) if times else None,
         min_ms=min(times) if times else None, max_ms=max(times) if times else None,
         jitter_ms=(None if not times else 0.0 if len(times) == 1 else statistics.pstdev(times)),
+        health_reason=reason,
     )
+
+
+def _sample_failure_reason(sample: BenchmarkSample) -> str:
+    if sample.http_status is not None and not 200 <= sample.http_status <= 399:
+        return f"HTTP {sample.http_status} outside accepted range 200-399"
+    error = (sample.error or "").casefold()
+    if "certificate" in error or "ssl" in error or "tls" in error:
+        return "TLS verification failed"
+    if "timed out" in error or "timeout" in error:
+        return "Connection timeout"
+    if "connection refused" in error:
+        return "Connection refused"
+    if "connection reset" in error or "reset by peer" in error:
+        return "Connection reset"
+    if "could not resolve" in error or "resolve host" in error:
+        return "Hostname/SNI resolution failed"
+    return "No valid HTTPS response"
 
 
 class HttpsBenchmarkRunner:
@@ -63,18 +88,24 @@ class HttpsBenchmarkRunner:
                                          connect_ms=connect_ms, tls_ms=max(0.0, appconnect_ms-connect_ms),
                                          total_ms=total_ms)
                 if not sample.valid:
-                    sample.error = "HTTP status outside accepted range 200-399 or missing timings"
+                    sample.error = (f"HTTP {status} outside accepted range 200-399"
+                                    if not 200 <= status <= 399 else "Missing HTTPS timing data")
+                    logger.info("Benchmark sample failed host=%s ip=%s run=%d reason=%s",
+                                hostname, ip, number, _sample_failure_reason(sample))
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 sample = BenchmarkSample(ip=ip, run_number=number, error=redact_secrets(exc))
-                logger.debug("Benchmark run failed host=%s ip=%s run=%d error_type=%s",
-                             hostname, ip, number, type(exc).__name__)
+                detail = _sample_failure_reason(sample)
+                logger.info("Benchmark sample failed host=%s ip=%s run=%d reason=%s detail=%s",
+                            hostname, ip, number, detail, redact_secrets(exc))
             samples.append(sample)
         aggregate = calculate_statistics(samples, self.runs_per_ip)
-        logger.info("Benchmark finished host=%s ip=%s valid=%d/%d healthy=%s avg_ms=%s",
-                    hostname, ip, aggregate.valid_runs, aggregate.requested_runs, aggregate.healthy, aggregate.average_ms)
+        logger.info("Benchmark finished host=%s ip=%s valid=%d/%d healthy=%s avg_ms=%s reason=%s",
+                    hostname, ip, aggregate.valid_runs, aggregate.requested_runs, aggregate.healthy,
+                    aggregate.average_ms, aggregate.health_reason or "healthy")
         if not aggregate.healthy:
-            logger.warning("Unhealthy benchmark candidate host=%s ip=%s valid=%d/%d",
-                           hostname, ip, aggregate.valid_runs, aggregate.requested_runs)
+            logger.warning("Unhealthy benchmark candidate host=%s ip=%s valid=%d/%d reason=%s",
+                           hostname, ip, aggregate.valid_runs, aggregate.requested_runs,
+                           aggregate.health_reason)
         return aggregate
 
     def _command(self, hostname: str, ip: str, path: str, port: int, skip_revocation: bool = False) -> list[str]:
