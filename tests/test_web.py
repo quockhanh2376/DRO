@@ -644,6 +644,156 @@ def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web,
     assert 'data-copy="192.0.2.1"' in failed_page.text
 
 
+def _seed_add_dns_target(database, hostname="add-dns.example", healthy=True):
+    from datetime import datetime, timezone
+    with database.session() as session:
+        target = save_target(session, Target(hostname=hostname))
+        result = BenchmarkResult(ip="192.0.2.44", healthy=healthy, valid_runs=10 if healthy else 0,
+                                requested_runs=10, average_ms=10 if healthy else None,
+                                median_ms=10 if healthy else None, min_ms=9 if healthy else None,
+                                max_ms=11 if healthy else None, jitter_ms=1 if healthy else None)
+        run = save_benchmark_run(session, target.id, [result], {
+            "current_rewrite_ip": None, "current_rewrite_lookup_succeeded": True,
+            "resolution_failed": False,
+        }, DecisionResult(action="KEEP", reason="test"))
+        target_id, run_id = target.id, run.id
+    return target_id, run_id
+
+
+def test_add_to_dns_button_requires_absent_live_rewrite_and_healthy_best(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    target_id, _ = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        existing = None
+        def get_rewrite(self, _hostname): return self.existing
+        def close(self): pass
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    assert "Add to DNS" in client.get(f"/targets/{target_id}").text
+    fake.existing = {"domain": "add-dns.example", "answer": "192.0.2.44"}
+    assert "Add to DNS" not in client.get(f"/targets/{target_id}").text
+
+
+def test_add_to_dns_creates_verifies_and_persists_once(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    target_id, run_id = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        existing = None
+        adds = 0
+        def get_rewrite(self, hostname):
+            return self.existing
+        def add_rewrite(self, hostname, ip):
+            self.adds += 1
+            self.existing = {"domain": hostname, "answer": ip}
+        def close(self): pass
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"].endswith("?rewrite=added")
+    assert fake.adds == 1
+    page = client.get(response.headers["location"])
+    assert "DNS rewrite added and verified" in page.text
+    assert 'data-copy="192.0.2.44"' in page.text
+    assert ">Add to DNS</button>" not in page.text
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.44"
+        history = session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+        assert len(history) == 1 and history[0].old_ip is None and history[0].new_ip == "192.0.2.44"
+        assert session.scalar(select(AuditLogRecord).where(
+            AuditLogRecord.event == "rewrite_added", AuditLogRecord.target_id == target_id)) is not None
+
+
+def test_add_to_dns_duplicate_syncs_existing_ip_without_add(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    target_id, run_id = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        adds = 0
+        def get_rewrite(self, _hostname): return {"domain": "add-dns.example", "answer": "192.0.2.55"}
+        def add_rewrite(self, *_args): self.adds += 1
+        def close(self): pass
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: pytest.fail("duplicate must not create"))
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.headers["location"].endswith("?rewrite=already-exists") and fake.adds == 0
+    assert "Domain already exists in AdGuard. DRO state was synchronized." in client.get(response.headers["location"]).text
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.55"
+        assert not session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+
+
+@pytest.mark.parametrize("healthy,stale", [(False, False), (True, True)])
+def test_add_to_dns_blocks_unhealthy_or_stale_best(web, monkeypatch, healthy, stale):
+    client, database = web
+    import app.web.routes as web_routes
+    from datetime import timedelta
+    from app.db.models import BenchmarkRunRecord, utc_now
+    target_id, run_id = _seed_add_dns_target(database, healthy=healthy)
+    if stale:
+        with database.session() as session:
+            run = session.get(BenchmarkRunRecord, run_id)
+            run.completed_at = utc_now() - timedelta(hours=2)
+    class FakeAdGuard:
+        adds = 0
+        def get_rewrite(self, _hostname): return None
+        def add_rewrite(self, *_args): self.adds += 1
+        def close(self): pass
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.status_code == 409 and fake.adds == 0
+
+
+def test_add_to_dns_failure_does_not_persist_current_ip(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    from app.integrations.adguard import AdGuardError
+    target_id, run_id = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        def get_rewrite(self, _hostname): return None
+        def add_rewrite(self, *_args): raise AdGuardError("failed")
+        def close(self): pass
+    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.headers["location"].endswith("?rewrite=add-failed")
+    assert "No success was recorded" in client.get(response.headers["location"]).text
+    with database.session() as session:
+        state = session.get(OptimizerStateRecord, target_id)
+        assert state is None or state.current_rewrite_ip is None
+        assert session.scalar(select(AuditLogRecord).where(
+            AuditLogRecord.event == "rewrite_add_failed", AuditLogRecord.target_id == target_id)) is not None
+
+
+def test_add_to_dns_requires_auth_csrf_and_explicit_confirmation(web):
+    client, database = web
+    target_id, run_id = _seed_add_dns_target(database)
+    csrf = client.headers["x-csrf-token"]
+    client.headers.pop("x-csrf-token")
+    assert client.post(f"/targets/{target_id}/add-to-dns",
+                       data={"run_id": run_id, "confirm": "true"}).status_code == 403
+    client.headers["x-csrf-token"] = "invalid"
+    assert client.post(f"/targets/{target_id}/add-to-dns",
+                       data={"run_id": run_id, "confirm": "true"}).status_code == 403
+    client.headers["x-csrf-token"] = csrf
+    assert client.post(f"/targets/{target_id}/add-to-dns",
+                       data={"run_id": run_id, "confirm": "false"}).status_code == 400
+
+
 def test_apply_uses_verified_readback_instead_of_requested_ip(web, monkeypatch):
     client, database = web
     import app.web.routes as web_routes

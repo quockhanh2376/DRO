@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import ipaddress
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -28,8 +30,9 @@ from app.models.target import Target
 from app.core.scheduler import (default_interval, default_interval_hours,
                                 record_target_run, scheduler_enabled, set_scheduler_enabled)
 from app.core.optimizer import read_adguard_rewrite
-from app.core.rewrites import automatic_rewrite_enabled, set_rewrite
-from app.integrations.adguard import AdGuardError
+from app.core.rewrites import automatic_rewrite_enabled, set_rewrite, _healthy
+from app.integrations.adguard import AdGuardError, configured_adguard_client
+from app.db.repositories import add_rewrite_history
 from app.core.live_ping import PingLimitReached, PingSession, ping_sessions
 from app.time_utils import format_vietnam_time, next_run_time
 from app.version import VERSION_DISPLAY
@@ -38,6 +41,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["web"])
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 templates.env.filters["vn_time"] = format_vietnam_time
+ADD_BEST_MAX_AGE = timedelta(hours=1)
 
 
 def _best_benchmark_result(run):
@@ -313,11 +317,24 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
     state = session.get(OptimizerStateRecord, target_id)
     current = next((item for item in latest.results if state and item.ip == state.current_rewrite_ip), None) if latest else None
     best = _best_benchmark_result(latest)
+    rewrite_absent = False
+    if (latest and not (state and state.current_rewrite_ip)
+            and latest.summary.get("current_rewrite_lookup_succeeded")
+            and latest.summary.get("current_rewrite_ip") is None):
+        try:
+            rewrite_client = configured_adguard_client()
+            rewrite_absent = rewrite_client.get_rewrite(target.hostname) is None
+        except Exception:
+            rewrite_absent = False
+        finally:
+            if "rewrite_client" in locals():
+                rewrite_client.close()
     return templates.TemplateResponse(request, "target_detail.html", _base_context(
         request, target=target, latest=latest, state=state, current=current, best=best,
         current_ip_override=(state.current_rewrite_ip if state else
                              latest.summary.get("current_rewrite_ip") if latest else None),
         rewrite_result=request.query_params.get("rewrite"),
+        rewrite_absent=rewrite_absent,
         runs=runs, rewrite_history=list_rewrite_history(session, target_id)))
 
 
@@ -392,6 +409,73 @@ def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Fo
     if not outcome.get("healthy") or verified_current_ip != new_ip:
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed", status_code=303)
     return RedirectResponse(f"/targets/{target_id}?rewrite=applied", status_code=303)
+
+
+@router.post("/targets/{target_id}/add-to-dns", name="add_best_rewrite",
+             dependencies=[Depends(protect_mutation)])
+def add_best_rewrite(target_id: int, request: Request, run_id: int = Form(...),
+                     confirm: bool = Form(False), session: Session = Depends(get_session)):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Explicit rewrite confirmation is required")
+    target = get_target_or_404(session, target_id)
+    runs = list_benchmark_runs(session, target_id)
+    run = get_benchmark_run(session, run_id)
+    if not run or run.target_id != target_id or not runs or runs[0].id != run_id:
+        raise HTTPException(status_code=409, detail="Add to DNS requires the latest benchmark result")
+    age = datetime.now(timezone.utc) - run.completed_at.replace(tzinfo=timezone.utc)
+    best = _best_benchmark_result(run)
+    if age < timedelta(0) or age > ADD_BEST_MAX_AGE or not best or not best.healthy:
+        raise HTTPException(status_code=409, detail="Best IP is unhealthy or the benchmark is stale")
+    try:
+        best_ip = str(ipaddress.IPv4Address(best.ip))
+    except ipaddress.AddressValueError as exc:
+        raise HTTPException(status_code=409, detail="Best IP is not a valid IPv4 address") from exc
+
+    client = None
+    try:
+        client = configured_adguard_client()
+        existing = client.get_rewrite(target.hostname)
+        if existing is not None:
+            answer = str(ipaddress.IPv4Address(existing["answer"]))
+            _persist_verified_current_ip(session, target_id, answer)
+            add_audit_event(session, "rewrite_duplicate_synchronized", target_id,
+                            {"ip": answer, "benchmark_run_id": run_id})
+            session.commit()
+            return RedirectResponse(f"/targets/{target_id}?rewrite=already-exists", status_code=303)
+        if not _healthy(Target.model_validate(target, from_attributes=True), best_ip):
+            add_audit_event(session, "rewrite_add_failed", target_id,
+                            {"ip": best_ip, "benchmark_run_id": run_id, "reason": "health_check_failed"})
+            session.commit()
+            return RedirectResponse(f"/targets/{target_id}?rewrite=unhealthy", status_code=303)
+        add_audit_event(session, "rewrite_add_started", target_id,
+                        {"ip": best_ip, "benchmark_run_id": run_id})
+        session.commit()
+        client.add_rewrite(target.hostname, best_ip)
+        verified = client.get_rewrite(target.hostname)
+        if not verified or verified.get("domain", "").rstrip(".").casefold() != target.hostname.rstrip(".").casefold():
+            raise AdGuardError("AdGuard rewrite readback did not match the requested hostname")
+        verified_ip = str(ipaddress.IPv4Address(verified["answer"]))
+        if verified_ip != best_ip:
+            raise AdGuardError("AdGuard rewrite readback did not match the requested IP")
+        add_rewrite_history(session, target_id, None, verified_ip, "Manual Add to DNS", run_id)
+        _persist_verified_current_ip(session, target_id, verified_ip)
+        add_audit_event(session, "rewrite_added", target_id,
+                        {"ip": verified_ip, "benchmark_run_id": run_id, "verified": True})
+        session.commit()
+        return RedirectResponse(f"/targets/{target_id}?rewrite=added", status_code=303)
+    except Exception as exc:
+        session.rollback()
+        try:
+            add_audit_event(session, "rewrite_add_failed", target_id,
+                            {"ip": best_ip, "benchmark_run_id": run_id, "error": type(exc).__name__})
+            session.commit()
+        except Exception:
+            session.rollback()
+        logger.warning("Add to DNS failed target_id=%d error=%s", target_id, type(exc).__name__)
+        return RedirectResponse(f"/targets/{target_id}?rewrite=add-failed", status_code=303)
+    finally:
+        if client is not None:
+            client.close()
 
 
 @router.post("/targets/{target_id}/lock", name="lock_target_page",
