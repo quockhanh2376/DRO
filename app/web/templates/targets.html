@@ -6,8 +6,10 @@
   <div class="target-card-heading"><h2>{{ "Edit target" if target else "Add target" }}</h2>
     <form class="target-search" id="target-search-form" role="search" onsubmit="return false">
       <label class="sr-only" for="target-search-input">Search domains</label>
-      <input id="target-search-input" type="search" autocomplete="off" placeholder="Search hostname or domain">
-      <button class="target-search-clear" type="button" id="target-search-clear" title="Clear search" aria-label="Clear search">&#215;</button>
+      <div class="target-search-field">
+        <input class="target-search-input" id="target-search-input" type="search" autocomplete="off" placeholder="Search hostname or domain">
+        <button class="target-search-clear" type="button" id="target-search-clear" title="Clear search" aria-label="Clear search">&#215;</button>
+      </div>
     </form>
   </div>
   {% if errors %}<div class="error" role="alert">{% for error in errors %}<p>{{ error }}</p>{% endfor %}</div>{% endif %}

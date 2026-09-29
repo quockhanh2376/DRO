@@ -171,6 +171,9 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
     assert 'id="target-search-input"' in card and 'type="search"' in card
     assert card.count('class="target-search-clear"') == 1
     assert 'id="target-search-clear"' in card and 'title="Clear search"' in card
+    search_field = card.split('class="target-search-field"', 1)[1].split("</div>", 1)[0]
+    assert 'class="target-search-input"' in search_field
+    assert 'class="target-search-clear"' in search_field
     assert '>Search</button>' not in page
     for target_id, _hostname in blocks:
         tbody = page.split(f'data-target-id="{target_id}"', 1)[1].split("</tbody>", 1)[0]
@@ -181,6 +184,9 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
     script = client.get("/static/targets.js").text
     assert 'document.addEventListener("input"' in script
     assert 'event.target.matches("#target-search-input")' in script
+    assert 'document.addEventListener("click"' in script
+    assert 'input.value = ""' in script and 'input.focus()' in script
+    assert "reorderTargetBlocks(event.target)" in script and "reorderTargetBlocks(input)" in script
     assert 'name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3' in script
     assert 'targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname)' in script
     assert 'document.addEventListener("click"' in script
@@ -194,6 +200,12 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
     assert 'block.classList.add("search-exact-match")' in script
     assert 'if (!query) return' in script
     stylesheet = client.get("/static/style.css").text
+    search_input_style = stylesheet.split(".target-search-input{", 1)[1].split("}", 1)[0]
+    assert "padding:8px 43px 8px 11px" in search_input_style
+    assert "font:400 17px/1.35" in search_input_style
+    assert ".target-search-input::placeholder{color:var(--muted);font:inherit" in stylesheet
+    assert ".target-search-clear{position:absolute" in stylesheet
+    assert ".target-search-field{position:relative" in stylesheet
     assert ".target-block.search-match .benchmark-hostname" in stylesheet
     assert ".target-block.search-best-match .benchmark-hostname" in stylesheet
     assert ".target-block.search-exact-match .benchmark-hostname" in stylesheet
