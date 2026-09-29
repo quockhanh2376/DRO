@@ -88,11 +88,11 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                 old_ip = str(ipaddress.IPv4Address(old_ip))
             except ipaddress.AddressValueError as exc:
                 raise AdGuardError("AdGuard current rewrite is not a valid IPv4 address") from exc
-        if expected_old_ip is not None and old_ip != expected_old_ip:
-            raise AdGuardError("AdGuard rewrite changed since the benchmark")
         if old_ip == new_ip:
             return {"changed": False, "old_ip": old_ip, "new_ip": new_ip,
-                    "verified_current_ip": old_ip, "healthy": True}
+                    "verified_current_ip": old_ip, "readback_verified": True, "healthy": True}
+        if expected_old_ip is not None and old_ip != expected_old_ip:
+            raise AdGuardError("AdGuard rewrite changed since the benchmark")
 
         # Commit an audit intent before the external mutation, so a broken database prevents DNS changes.
         add_audit_event(session, "rewrite_change_started", record.id,
