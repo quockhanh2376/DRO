@@ -27,6 +27,23 @@ def web(tmp_path, monkeypatch):
     database = Database(f"sqlite:///{(tmp_path / 'web.db').as_posix()}")
     Base.metadata.create_all(database.engine)
     app = create_app(database=database, benchmark_cycle=lambda *_args: {})
+    import app.web.routes as web_routes
+
+    class TestPageAdGuard:
+        def list_rewrites(self):
+            with database.session() as session:
+                targets = session.scalars(select(TargetRecord)).all()
+            rewrites = []
+            for target in targets:
+                ip, succeeded = web_routes.read_adguard_rewrite(target.hostname)
+                if not succeeded:
+                    raise RuntimeError("simulated AdGuard list read failure")
+                if succeeded and ip:
+                    rewrites.append({"domain": target.hostname, "answer": ip})
+            return rewrites
+        def close(self): pass
+
+    monkeypatch.setattr(web_routes, "configured_adguard_client", TestPageAdGuard)
     with TestClient(app) as client:
         login_page = client.get("/login")
         csrf = re.search(r'name="csrf_token" value="([^"]+)"', login_page.text).group(1)
@@ -294,7 +311,8 @@ def test_unresolvable_valid_hostname_renders_diagnostic_state(web):
         target_id = target.id
     page = client.get(f"/targets/{target_id}").text
     assert 'class="unavailable-value">Unavailable</span>' in page
-    assert page.count('class="unavailable-value">Unavailable</span>') == 3
+    assert page.count('class="unavailable-value">Unavailable</span>') >= 2
+    assert "AdGuard read failed" in page
     assert "No valid IP found" in page
     assert "Unable to resolve this domain. Please double-check the hostname and try again." in page
     assert "RESOLUTION FAILED" in page
@@ -837,6 +855,10 @@ def test_apply_navigation_keeps_dashboard_targets_and_detail_on_adguard_current_
     class FakeAdGuard:
         current = "108.157.32.2"
         writes = []
+        list_calls = 0
+        def list_rewrites(self):
+            self.list_calls += 1
+            return [{"domain": "APP.MYOB.COM.", "answer": self.current}] if self.current else []
         def get_rewrite(self, hostname): return {"domain": hostname, "answer": self.current}
         def update_rewrite(self, old_domain, old_ip, domain, answer):
             self.writes.append((old_domain, old_ip, domain, answer))
@@ -848,6 +870,7 @@ def test_apply_navigation_keeps_dashboard_targets_and_detail_on_adguard_current_
 
     fake = FakeAdGuard()
     monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (fake.current, True))
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
     monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
     monkeypatch.setattr(rewrites, "_healthy", lambda _target, _ip: True)
 
@@ -863,9 +886,14 @@ def test_apply_navigation_keeps_dashboard_targets_and_detail_on_adguard_current_
         "run_id": run_id, "old_ip": "108.157.32.2", "new_ip": "108.157.32.71", "confirm": "true",
     }, follow_redirects=False)
     assert applied.status_code == 303
-    detail = client.get(applied.headers["location"]).text
-    targets = client.get("/targets").text
-    dashboard = client.get("/").text
+    detail_response = client.get(applied.headers["location"])
+    targets_response = client.get("/targets")
+    dashboard_response = client.get("/")
+    targets_again_response = client.get("/targets")
+    detail_again_response = client.get(f"/targets/{target_id}")
+    dashboard_again_response = client.get("/")
+    run_state_response = client.get(f"/targets/{target_id}/run/state")
+    detail, targets, dashboard = detail_response.text, targets_response.text, dashboard_response.text
     result_block = targets.split(f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
     dashboard_row = re.search(rf'<tr><td><a href="/targets/{target_id}">app\.myob\.com</a>(.*?)</tr>',
                               dashboard, re.S).group(1)
@@ -881,8 +909,49 @@ def test_apply_navigation_keeps_dashboard_targets_and_detail_on_adguard_current_
     assert "108.157.32.71" in dashboard_row
     assert "108.157.32.2" not in current_inline and "108.157.32.2" not in dashboard_row
     assert fake.writes == [("app.myob.com", "108.157.32.2", "app.myob.com", "108.157.32.71")]
+    for response in (targets_response, dashboard_response, targets_again_response,
+                     detail_again_response, dashboard_again_response, run_state_response):
+        assert "no-store" in response.headers["cache-control"]
+        assert response.headers["pragma"] == "no-cache"
+    assert 'hx-history="false"' in detail_again_response.text
+    state_current = run_state_response.text.split("Current IP:</span>", 1)[1].split("</strong>", 1)[0]
+    assert "108.157.32.71" in state_current and "108.157.32.2" not in state_current
+    assert '>Apply Best IP</button>' not in run_state_response.text
+    for response in (targets_again_response, dashboard_again_response, detail_again_response):
+        assert '>Apply Best IP</button>' not in response.text
+        assert "108.157.32.71" in response.text
+    second_target_result = targets_again_response.text.split(
+        f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    second_target_current = second_target_result.split("Current IP:</span>", 1)[1].split("</strong>", 1)[0]
+    detail_current = detail_again_response.text.split("<span>Current rewrite</span>", 1)[1].split("</article>", 1)[0]
+    assert "108.157.32.71" in second_target_current and "108.157.32.2" not in second_target_current
+    assert "108.157.32.71" in detail_current and "108.157.32.2" not in detail_current
+    assert fake.list_calls == 9  # one AdGuard rewrite-list fetch per dynamic page request
     with database.session() as session:
         assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == fake.current == "108.157.32.71"
+
+
+def test_authoritative_rewrite_map_batches_and_normalizes_all_requested_hosts(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    with database.session() as session:
+        first = save_target(session, Target(hostname="One.Example."))
+        second = save_target(session, Target(hostname="two.example"))
+
+    class RewriteList:
+        calls = 0
+        def list_rewrites(self):
+            self.calls += 1
+            return [{"domain": "ONE.EXAMPLE", "answer": "108.157.32.71"},
+                    {"domain": "two.example.", "answer": "192.0.2.8"}]
+        def close(self): pass
+
+    fake = RewriteList()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    result = web_routes._authoritative_rewrite_map([first, second])
+    assert result == {"one.example": ("108.157.32.71", True),
+                      "two.example": ("192.0.2.8", True)}
+    assert fake.calls == 1
 
 
 def test_true_external_rewrite_change_after_route_read_conflicts_and_syncs(web, monkeypatch):

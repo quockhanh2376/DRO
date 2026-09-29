@@ -7,7 +7,7 @@
   <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
   <script src="/static/apply.js" defer></script>
 </head>
-<body hx-boost="true">
+<body hx-boost="true" hx-history="false">
   <header class="topbar"><a class="brand" href="/">DRO <span class="brand-version">{{ version }}</span></a><nav>
     <a href="/">Dashboard</a><a href="/targets">Targets</a><a href="/history">History</a>
     <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link" type="submit">Log out</button></form>

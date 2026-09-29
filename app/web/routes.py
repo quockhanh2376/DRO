@@ -42,6 +42,11 @@ router = APIRouter(tags=["web"])
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 templates.env.filters["vn_time"] = format_vietnam_time
 ADD_BEST_MAX_AGE = timedelta(hours=1)
+NO_CACHE_HEADERS = {
+    "Cache-Control": "private, no-store, no-cache, max-age=0, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 def _best_benchmark_result(run):
@@ -52,6 +57,15 @@ def _best_benchmark_result(run):
                                  item.median_ms if item.median_ms is not None else float("inf"),
                                  item.jitter_ms if item.jitter_ms is not None else float("inf")),
                default=None)
+
+
+def _normalized_ipv4(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError:
+        return None
 
 
 def _base_context(request: Request, **values):
@@ -68,9 +82,52 @@ def _persist_verified_current_ip(session: Session, target_id: int, current_ip: s
     session.commit()
 
 
-def _sync_authoritative_current_ip(session: Session, target: TargetRecord) -> tuple[str | None, bool]:
-    """Read Current Rewrite from AdGuard and refresh DRO cache only after a successful read."""
-    current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+def _authoritative_rewrite_map(targets: list[TargetRecord]) -> dict[str, tuple[str | None, bool]]:
+    """Fetch AdGuard rewrites once and map requested hostnames to live normalized IPv4 values."""
+    keys = {target.hostname.rstrip(".").casefold() for target in targets}
+    result = {key: (None, False) for key in keys}
+    if not keys:
+        return result
+    try:
+        client = configured_adguard_client()
+    except Exception as exc:
+        logger.warning("Current AdGuard rewrite list unavailable error=%s", type(exc).__name__)
+        return result
+    try:
+        rewrites = client.list_rewrites()
+    except Exception as exc:
+        logger.warning("Current AdGuard rewrite list unavailable error=%s", type(exc).__name__)
+        return result
+    finally:
+        client.close()
+    matches: dict[str, list[str]] = {key: [] for key in keys}
+    for item in rewrites:
+        key = item["domain"].rstrip(".").casefold()
+        if key in matches:
+            matches[key].append(item["answer"])
+    for key, answers in matches.items():
+        if not answers:
+            result[key] = (None, True)
+            continue
+        if len(answers) != 1:
+            continue
+        try:
+            parsed = ipaddress.IPv4Address(answers[0])
+        except ipaddress.AddressValueError:
+            continue
+        result[key] = (str(parsed), True)
+    return result
+
+
+def _sync_authoritative_current_ip(session: Session, target: TargetRecord,
+                                   rewrite_map: dict[str, tuple[str | None, bool]] | None = None
+                                   ) -> tuple[str | None, bool]:
+    """Refresh DRO cache from this request's live AdGuard read; never fall back on failure."""
+    key = target.hostname.rstrip(".").casefold()
+    if rewrite_map is None:
+        current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+    else:
+        current_ip, lookup_succeeded = rewrite_map.get(key, (None, False))
     if not lookup_succeeded:
         return None, False
     state = session.get(OptimizerStateRecord, target.id)
@@ -85,7 +142,9 @@ def _sync_authoritative_current_ip(session: Session, target: TargetRecord) -> tu
 
 def _dashboard_rows(session: Session) -> list[dict]:
     rows = []
-    for target in list_targets(session):
+    targets = list_targets(session)
+    rewrite_map = _authoritative_rewrite_map(targets)
+    for target in targets:
         run = session.scalar(select(BenchmarkRunRecord).where(
             BenchmarkRunRecord.target_id == target.id
         ).order_by(BenchmarkRunRecord.completed_at.desc()).limit(1))
@@ -95,7 +154,7 @@ def _dashboard_rows(session: Session) -> list[dict]:
                                        result.median_ms if result.median_ms is not None else float("inf"),
                                        result.jitter_ms if result.jitter_ms is not None else float("inf")),
                    default=None)
-        current_ip, current_lookup_succeeded = _sync_authoritative_current_ip(session, target)
+        current_ip, current_lookup_succeeded = _sync_authoritative_current_ip(session, target, rewrite_map)
         state = session.get(OptimizerStateRecord, target.id)
         schedule = session.get(ScheduleStateRecord, target.id)
         current = next((item for item in results if current_lookup_succeeded
@@ -113,10 +172,20 @@ def _dashboard_rows(session: Session) -> list[dict]:
                      "next_run": schedule.next_run_at if schedule else next_run,
                      "status": "Disabled" if not target.enabled else
                      "No benchmark" if not run else "Healthy" if best else "Critical"})
+        logger.info("render_current_ip page=dashboard hostname=%s adguard_current_ip=%s optimizer_state.current_rewrite_ip=%s benchmark_snapshot_current_ip=%s best_ip=%s final_current_ip_used_for_render=%s apply_eligible=%s adguard_read_succeeded=%s",
+                    target.hostname, current_ip if current_lookup_succeeded and current_ip else "Unavailable",
+                    state.current_rewrite_ip if state else None,
+                    run.summary.get("current_rewrite_ip") if run else None,
+                    best.ip if best else None,
+                    current_ip if current_lookup_succeeded and current_ip else "Unavailable",
+                    bool(current_ip and best and best.healthy
+                         and current_ip != _normalized_ipv4(best.ip)), current_lookup_succeeded)
     return rows
 
 
-def _add_to_dns_eligibility(session: Session, target: TargetRecord, run=None) -> dict:
+def _add_to_dns_eligibility(session: Session, target: TargetRecord, run=None,
+                            rewrite_map: dict[str, tuple[str | None, bool]] | None = None,
+                            page: str = "detail") -> dict:
     """Resolve eligibility and the current rewrite from the authoritative AdGuard read."""
     runs = list_benchmark_runs(session, target.id)
     latest = get_benchmark_run(session, runs[0].id) if runs else None
@@ -124,10 +193,22 @@ def _add_to_dns_eligibility(session: Session, target: TargetRecord, run=None) ->
         run = latest
     latest = latest or run
     best = _best_benchmark_result(latest)
-    current_ip, lookup_succeeded = _sync_authoritative_current_ip(session, target)
+    current_ip, lookup_succeeded = _sync_authoritative_current_ip(session, target, rewrite_map)
     result = {"latest": latest, "best": best, "can_add_to_dns": False,
               "current_ip": current_ip if lookup_succeeded else None,
               "current_rewrite_lookup_succeeded": lookup_succeeded}
+    state = session.get(OptimizerStateRecord, target.id)
+    normalized_best_ip = _normalized_ipv4(best.ip if best else None)
+    can_apply = bool(lookup_succeeded and current_ip and best and best.healthy
+                     and normalized_best_ip and current_ip != normalized_best_ip)
+    result["apply_eligible"] = can_apply
+    logger.info("render_current_ip page=%s hostname=%s adguard_current_ip=%s optimizer_state.current_rewrite_ip=%s benchmark_snapshot_current_ip=%s best_ip=%s final_current_ip_used_for_render=%s apply_eligible=%s adguard_read_succeeded=%s",
+                page, target.hostname, current_ip if lookup_succeeded and current_ip else "Unavailable",
+                state.current_rewrite_ip if state else None,
+                latest.summary.get("current_rewrite_ip") if latest else None,
+                best.ip if best else None,
+                current_ip if lookup_succeeded and current_ip else "Unavailable",
+                can_apply, lookup_succeeded)
     if (not latest or not target.enabled or not best or not best.healthy or not best.ip
             or best.average_ms is None):
         return result
@@ -142,9 +223,12 @@ def _add_to_dns_eligibility(session: Session, target: TargetRecord, run=None) ->
     return result
 
 
-def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, tuple]:
+def _latest_run_map(session: Session, targets: list[TargetRecord],
+                    rewrite_map: dict[str, tuple[str | None, bool]] | None = None) -> dict[int, tuple]:
     if not targets:
         return {}
+    if rewrite_map is None:
+        rewrite_map = _authoritative_rewrite_map(targets)
     target_ids = [target.id for target in targets]
     latest_runs = {}
     runs = session.scalars(select(BenchmarkRunRecord).where(
@@ -155,10 +239,11 @@ def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, 
     for run in runs:
         if run.target_id not in latest_runs:
             target = targets_by_id[run.target_id]
-            eligibility = _add_to_dns_eligibility(session, target, run)
+            eligibility = _add_to_dns_eligibility(session, target, run, rewrite_map, page="targets")
             latest_runs[run.target_id] = (run, eligibility["best"], eligibility["can_add_to_dns"],
                                           eligibility["current_ip"],
-                                          eligibility["current_rewrite_lookup_succeeded"])
+                                          eligibility["current_rewrite_lookup_succeeded"],
+                                          eligibility["apply_eligible"])
     return latest_runs
 
 
@@ -170,14 +255,19 @@ def dashboard(request: Request, session: Session = Depends(get_session)):
 @router.get("/targets", response_class=HTMLResponse, name="targets_page", dependencies=[Depends(require_admin)])
 def targets_page(request: Request, session: Session = Depends(get_session)):
     targets = sorted(list_targets(session), key=lambda target: target.hostname.casefold())
-    latest_runs = _latest_run_map(session, targets)
-    return templates.TemplateResponse(request, "targets.html",
+    rewrite_map = _authoritative_rewrite_map(targets)
+    for target in targets:
+        _sync_authoritative_current_ip(session, target, rewrite_map)
+    latest_runs = _latest_run_map(session, targets, rewrite_map)
+    response = templates.TemplateResponse(request, "targets.html",
                                       _base_context(request, targets=targets,
                                                     target_rows=[{"target": item, "sequence": index}
                                                                  for index, item in enumerate(targets, 1)],
                                                     latest_runs=latest_runs, target=None,
                                                     errors=None,
                                                     default_interval_hours=default_interval_hours(session)))
+    response.headers.update(NO_CACHE_HEADERS)
+    return response
 
 
 @router.get("/targets/{target_id}/run/state", response_class=HTMLResponse,
@@ -187,10 +277,16 @@ def run_state_page(target_id: int, request: Request, session: Session = Depends(
     run_status, queue_position = request.app.state.run_coordinator.state(target_id)
     runs = list_benchmark_runs(session, target_id)
     latest = get_benchmark_run(session, runs[0].id) if runs else None
-    eligibility = _add_to_dns_eligibility(session, target, latest)
-    return templates.TemplateResponse(request, "run_state.html", _base_context(
+    rewrite_map = _authoritative_rewrite_map([target])
+    eligibility = _add_to_dns_eligibility(session, target, latest, rewrite_map, page="targets")
+    response = templates.TemplateResponse(request, "run_state.html", _base_context(
         request, target=target, run_status=run_status, queue_position=queue_position,
-        latest=latest, best=eligibility["best"], can_add_to_dns=eligibility["can_add_to_dns"]))
+        latest=latest, best=eligibility["best"], can_add_to_dns=eligibility["can_add_to_dns"],
+        current_ip_override=eligibility["current_ip"],
+        current_rewrite_lookup_succeeded_override=eligibility["current_rewrite_lookup_succeeded"],
+        apply_eligible_override=eligibility["apply_eligible"]))
+    response.headers.update(NO_CACHE_HEADERS)
+    return response
 
 
 @router.post("/targets/{target_id}/ping", response_class=HTMLResponse, name="ping_target_page",
@@ -287,12 +383,17 @@ def create_target_page(
     except (ValueError, TypeError) as exc:
         logger.info("Target creation rejected")
         targets = list_targets(session)
-        return templates.TemplateResponse(request, "targets.html", _base_context(
-            request, targets=targets, latest_runs=_latest_run_map(session, targets), target=None, errors=[str(exc)],
+        rewrite_map = _authoritative_rewrite_map(targets)
+        for listed_target in targets:
+            _sync_authoritative_current_ip(session, listed_target, rewrite_map)
+        response = templates.TemplateResponse(request, "targets.html", _base_context(
+            request, targets=targets, latest_runs=_latest_run_map(session, targets, rewrite_map), target=None, errors=[str(exc)],
             form_values=_target_form_values(hostname, enabled, mode, interval_hours, runs_per_ip,
                                             switch_threshold_ms, switch_threshold_percent, manual_lock_ip),
             default_interval_hours=default_interval_hours(session)),
             status_code=422)
+        response.headers.update(NO_CACHE_HEADERS)
+        return response
     logger.info("Target created hostname=%s", record.hostname)
     return RedirectResponse("/targets", status_code=303)
 
@@ -302,11 +403,16 @@ def create_target_page(
 def edit_target_page(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
     targets = list_targets(session)
-    return templates.TemplateResponse(request, "targets.html",
+    rewrite_map = _authoritative_rewrite_map(targets)
+    for listed_target in targets:
+        _sync_authoritative_current_ip(session, listed_target, rewrite_map)
+    response = templates.TemplateResponse(request, "targets.html",
                                       _base_context(request, targets=targets,
-                                                    latest_runs=_latest_run_map(session, targets), target=target,
+                                                    latest_runs=_latest_run_map(session, targets, rewrite_map), target=target,
                                                     errors=None,
                                                     default_interval_hours=default_interval_hours(session)))
+    response.headers.update(NO_CACHE_HEADERS)
+    return response
 
 
 @router.post("/targets/{target_id}/edit", response_class=HTMLResponse, name="update_target_page",
@@ -369,13 +475,16 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
     runs = list_benchmark_runs(session, target_id)
     latest = get_benchmark_run(session, runs[0].id) if runs else None
     state = session.get(OptimizerStateRecord, target_id)
-    current = next((item for item in latest.results if state and item.ip == state.current_rewrite_ip), None) if latest else None
     best = _best_benchmark_result(latest)
-    eligibility = _add_to_dns_eligibility(session, target, latest)
-    return templates.TemplateResponse(request, "target_detail.html", _base_context(
+    rewrite_map = _authoritative_rewrite_map([target])
+    eligibility = _add_to_dns_eligibility(session, target, latest, rewrite_map, page="detail")
+    current = next((item for item in latest.results if eligibility["current_ip"] and
+                    item.ip == eligibility["current_ip"]), None) if latest else None
+    response = templates.TemplateResponse(request, "target_detail.html", _base_context(
         request, target=target, latest=latest, state=state, current=current, best=best,
         current_ip_override=eligibility["current_ip"],
         current_rewrite_lookup_succeeded_override=eligibility["current_rewrite_lookup_succeeded"],
+        apply_eligible_override=eligibility["apply_eligible"],
         authoritative_current_ip=eligibility["current_ip"],
         authoritative_current_ip_succeeded=eligibility["current_rewrite_lookup_succeeded"],
         rewrite_result=request.query_params.get("rewrite"),
@@ -386,6 +495,8 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
         rewrite_reason=request.query_params.get("reason"),
         can_add_to_dns=eligibility["can_add_to_dns"],
         runs=runs, rewrite_history=list_rewrite_history(session, target_id)))
+    response.headers.update(NO_CACHE_HEADERS)
+    return response
 
 
 @router.post("/targets/{target_id}/run", name="run_target_now",
@@ -412,12 +523,16 @@ def run_target_now(target_id: int, request: Request, session: Session = Depends(
     if request.headers.get("HX-Request", "").lower() == "true":
         runs = list_benchmark_runs(session, target_id)
         latest = get_benchmark_run(session, runs[0].id) if runs else None
-        eligibility = _add_to_dns_eligibility(session, target, latest)
-        return templates.TemplateResponse(request, "run_state.html", _base_context(
+        rewrite_map = _authoritative_rewrite_map([target])
+        eligibility = _add_to_dns_eligibility(session, target, latest, rewrite_map, page="targets")
+        response = templates.TemplateResponse(request, "run_state.html", _base_context(
             request, target=target, run_status=run_status, queue_position=queue_position,
             latest=latest, best=eligibility["best"], can_add_to_dns=eligibility["can_add_to_dns"],
             current_ip_override=eligibility["current_ip"],
-            current_rewrite_lookup_succeeded_override=eligibility["current_rewrite_lookup_succeeded"]))
+            current_rewrite_lookup_succeeded_override=eligibility["current_rewrite_lookup_succeeded"],
+            apply_eligible_override=eligibility["apply_eligible"]))
+        response.headers.update(NO_CACHE_HEADERS)
+        return response
     return RedirectResponse(f"/targets/{target_id}", status_code=303)
 
 
@@ -696,7 +811,7 @@ def _settings_response(request: Request, session: Session, errors=None,
     except ValueError:
         log_retention_days = 7
     configured_history_value, configured_history_unit = configured_benchmark_history_retention(session)
-    return templates.TemplateResponse(request, "dashboard.html", _base_context(
+    response = templates.TemplateResponse(request, "dashboard.html", _base_context(
         request, rows=_dashboard_rows(session),
         adguard_url=safe_endpoint(os.getenv("ADGUARD_URL") or "Not configured"),
         scheduler_enabled=scheduler_enabled(session),
@@ -709,6 +824,8 @@ def _settings_response(request: Request, session: Session, errors=None,
         benchmark_history_value=history_value if history_value is not None else configured_history_value,
         benchmark_history_unit=history_unit if history_unit is not None else configured_history_unit,
         settings_errors=errors), status_code=status_code)
+    response.headers.update(NO_CACHE_HEADERS)
+    return response
 
 
 @router.post("/settings/benchmark-history-retention", name="benchmark_history_retention_setting",

@@ -3,7 +3,7 @@
   {% set resolution_failed = latest.summary.get('resolution_failed', false) %}
   {% set current_ip = current_ip_override if current_ip_override is defined else latest.summary.get('current_rewrite_ip') %}
   {% set current_lookup_succeeded = current_rewrite_lookup_succeeded_override if current_rewrite_lookup_succeeded_override is defined else latest.summary.get('current_rewrite_lookup_succeeded') %}
-  {% set can_apply = not resolution_failed and current_lookup_succeeded and current_ip and best and best.healthy and current_ip != best.ip %}
+  {% set can_apply = apply_eligible_override|default(false) %}
   <div class="benchmark-result-top">
     <h2>Benchmark result: <span class="benchmark-hostname">{{ target.hostname }}</span>{% if can_add_to_dns|default(false) %}
       <form method="post" action="/targets/{{ target.id }}/add-to-dns" class="add-to-dns-form" data-confirm="Add {{ target.hostname }} -> {{ best.ip }} to AdGuard DNS Rewrite?" onsubmit="return confirm(this.dataset.confirm)">
@@ -13,7 +13,7 @@
         <button class="button primary" type="submit">Add to DNS</button>
       </form>
     {% endif %}</h2>
-    <div class="benchmark-result-ip"><span>Current IP:</span><strong>{% if resolution_failed or not current_lookup_succeeded %}<span class="unavailable-value">Unavailable</span>{% else %}{% set ip_value = current_ip %}{% include "ip_copy.html" %}{% endif %}</strong></div>
+    <div class="benchmark-result-ip"><span>Current IP:</span><strong>{% if not current_lookup_succeeded %}<span class="unavailable-value">Unavailable</span><small class="current-ip-reason">AdGuard read failed</small>{% else %}{% set ip_value = current_ip %}{% include "ip_copy.html" %}{% endif %}</strong></div>
     <div class="benchmark-result-ip"><span>Best IP:</span><strong class="best-ip">{% if resolution_failed %}<span class="unavailable-value">Unavailable</span>{% else %}{% set ip_value = best.ip if best else None %}{% include "ip_copy.html" %}{% endif %}</strong></div>
     <div class="benchmark-result-apply">{% if can_apply %}
       <form id="apply-best-form-{{ target.id }}" method="post" action="/targets/{{ target.id }}/apply-best" class="apply-best-form" hx-boost="false" data-confirm="Apply best IP? This will change the AdGuard rewrite from {{ current_ip }} to {{ best.ip }}." onsubmit="return confirm(this.dataset.confirm)">
