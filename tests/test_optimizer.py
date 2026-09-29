@@ -174,6 +174,40 @@ def test_cycle_persistence_rolls_back_when_audit_write_fails(monkeypatch, tmp_pa
     db.close()
 
 
+def test_public_candidate_never_replaces_unavailable_authoritative_rewrite(monkeypatch, tmp_path):
+    class Discovery:
+        def discover(self, _hostname): return ["108.157.32.2"]
+        def close(self): pass
+
+    class Runner:
+        def __init__(self, *_args): pass
+        def benchmark(self, _hostname, ips, **_kwargs):
+            assert ips == ["108.157.32.2"]
+            return [BenchmarkResult(ip=ips[0], healthy=True, valid_runs=1, requested_runs=1,
+                                    average_ms=10, median_ms=10, min_ms=10, max_ms=10,
+                                    jitter_ms=0)]
+
+    monkeypatch.setattr(optimizer, "PublicDnsDiscovery", Discovery)
+    monkeypatch.setattr(optimizer, "HttpsBenchmarkRunner", Runner)
+    monkeypatch.setattr(optimizer, "read_adguard_rewrite", lambda _hostname: (None, False))
+    db = Database(f"sqlite:///{(tmp_path / 'optimizer-current-source.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+    with db.session() as session:
+        target = save_target(session, Target(hostname="source.example"))
+        state = OptimizerStateRecord(target_id=target.id, current_rewrite_ip="108.157.32.65")
+        session.add(state)
+        session.commit()
+        output = optimizer.run_benchmark_cycle(session, target)
+        assert output["public_ips"] == ["108.157.32.2"]
+        assert output["current_ip"] is None
+        assert output["candidate_ips"] == ["108.157.32.2"]
+        run = session.get(BenchmarkRunRecord, output["benchmark_run_id"])
+        assert run.summary["current_rewrite_ip"] is None
+        assert run.summary["current_rewrite_lookup_succeeded"] is False
+        assert session.get(OptimizerStateRecord, target.id).current_rewrite_ip is None
+    db.close()
+
+
 def test_benchmark_run_persists_aggregated_candidate_failure_summaries(monkeypatch, tmp_path):
     class Discovery:
         def discover(self, _hostname): return ["113.171.12.192", "113.171.12.178"]

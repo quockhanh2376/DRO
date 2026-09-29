@@ -294,7 +294,7 @@ def test_unresolvable_valid_hostname_renders_diagnostic_state(web):
         target_id = target.id
     page = client.get(f"/targets/{target_id}").text
     assert 'class="unavailable-value">Unavailable</span>' in page
-    assert page.count('class="unavailable-value">Unavailable</span>') == 2
+    assert page.count('class="unavailable-value">Unavailable</span>') == 3
     assert "No valid IP found" in page
     assert "Unable to resolve this domain. Please double-check the hostname and try again." in page
     assert "RESOLUTION FAILED" in page
@@ -330,10 +330,7 @@ def test_unhealthy_current_without_healthy_alternative_stays_critical_and_no_app
                              DecisionResult(action="KEEP", current_ip=current.ip,
                                             reason="Current IP is unhealthy and no healthy alternative is available."))
         target_id = target.id
-    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: type("Client", (), {
-        "get_rewrite": lambda _self, _host: {"domain": hostname, "answer": current.ip},
-        "close": lambda _self: None,
-    })())
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _host: (current.ip, True))
     detail = client.get(f"/targets/{target_id}").text
     dashboard = client.get("/").text
     assert "Current IP is unhealthy and no healthy alternative is available." in detail
@@ -708,7 +705,7 @@ def test_target_pages_not_found_and_manual_run_redirect(web):
 
 def test_apply_best_button_requires_verified_current_and_healthy_different_best(web, monkeypatch):
     client, database = web
-    from app.core import optimizer
+    import app.web.routes as web_routes
 
     for index, (lookup_ok, best_healthy, best_ip) in enumerate((
             (True, True, "192.0.2.2"), (False, True, "192.0.2.2"),
@@ -722,12 +719,14 @@ def test_apply_best_button_requires_verified_current_and_healthy_different_best(
                 results.append(BenchmarkResult(ip=best_ip, healthy=best_healthy, valid_runs=10,
                                                requested_runs=10, average_ms=10, median_ms=10,
                                                min_ms=9, max_ms=11, jitter_ms=1))
-            run = save_benchmark_run(session, target.id, results, {
+            save_benchmark_run(session, target.id, results, {
                 "current_rewrite_ip": "192.0.2.1",
                 "current_rewrite_lookup_succeeded": lookup_ok,
             }, DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip=best_ip,
                               reason="Candidate is faster"))
             target_id = target.id
+        monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                            lambda _hostname: ("192.0.2.1", True) if lookup_ok else (None, False))
         page = client.get(f"/targets/{target_id}").text
         should_apply = lookup_ok and best_healthy and best_ip != "192.0.2.1"
         assert ("Apply Best IP" in page) is should_apply
@@ -739,6 +738,71 @@ def test_apply_best_button_requires_verified_current_and_healthy_different_best(
         assert ("Apply Best IP" in polled) is should_apply
         if lookup_ok and best_healthy and best_ip != "192.0.2.1":
             assert "from 192.0.2.1 to 192.0.2.2" in page
+
+
+def test_apply_uses_live_adguard_rewrite_when_dro_cache_and_benchmark_are_stale(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="app.myob.com"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="108.157.32.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "108.157.32.2", "current_rewrite_lookup_succeeded": True,
+            "resolution_failed": False},
+            DecisionResult(action="UPDATE", current_ip="108.157.32.2", candidate_ip="108.157.32.2",
+                           reason="Healthy candidate"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="108.157.32.2"))
+        session.commit()
+
+    class FakeAdGuard:
+        current = "108.157.32.65"
+        update_calls = []
+        def get_rewrite(self, hostname):
+            assert hostname == "app.myob.com"
+            return {"domain": hostname, "answer": self.current}
+        def update_rewrite(self, old_domain, old_ip, domain, answer):
+            self.update_calls.append((old_domain, old_ip, domain, answer))
+            assert (old_domain, old_ip) == ("app.myob.com", "108.157.32.65")
+            self.current = answer
+        def add_rewrite(self, *_args): pytest.fail("Apply must update the existing rewrite")
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (fake.current, True))
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    monkeypatch.setattr(rewrites, "_healthy", lambda _target, _ip: True)
+
+    detail = client.get(f"/targets/{target_id}").text
+    inline = client.get("/targets").text
+    assert '<span>Current rewrite</span><strong><span class="ip-copy-value">108.157.32.65' in detail
+    assert 'class="benchmark-hostname">app.myob.com' in inline
+    inline_result = inline.split(f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    assert 'class="ip-copy-value">108.157.32.65' in inline_result
+    assert "Apply Best IP" in inline_result and ">Add to DNS</button>" not in inline_result
+
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "108.157.32.2", "new_ip": "108.157.32.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].endswith(
+        "?rewrite=applied&old_ip=108.157.32.65&new_ip=108.157.32.2")
+    assert fake.update_calls == [("app.myob.com", "108.157.32.65", "app.myob.com", "108.157.32.2")]
+    refreshed = client.get(response.headers["location"]).text
+    assert "DNS rewrite updated: 108.157.32.65 -&gt; 108.157.32.2" in refreshed
+    assert 'class="ip-copy-value">108.157.32.2' in refreshed
+    with database.session() as session:
+        state = session.get(OptimizerStateRecord, target_id)
+        assert state.current_rewrite_ip == fake.current == "108.157.32.2"
+        history = session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+        assert len(history) == 1
+        assert (history[0].old_ip, history[0].new_ip) == ("108.157.32.65", "108.157.32.2")
 
 
 def test_inline_and_standalone_share_apply_button_template(web):
@@ -767,7 +831,9 @@ def test_apply_button_forms_are_native_post_forms_in_inline_and_detail_paths(web
             DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip="192.0.2.2",
                            reason="Candidate is faster"))
         target_id, run_id = target.id, run.id
-    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    live_rewrite = {"ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: (live_rewrite["ip"], True))
     calls = []
 
     def applied(session, target, new_ip, _reason, _run_id, **_kwargs):
@@ -844,11 +910,14 @@ def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web,
             DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip="192.0.2.2",
                            reason="Candidate is faster"))
         target_id, run_id = target.id, run.id
-    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    live_rewrite = {"ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: (live_rewrite["ip"], True))
     calls = []
     def apply_verified(session, target, ip, reason, selected_run, **kwargs):
         from app.db.models import OptimizerStateRecord
         calls.append((ip, reason, selected_run, kwargs.get("expected_old_ip")))
+        live_rewrite["ip"] = ip
         state = session.get(OptimizerStateRecord, target.id)
         if state is None:
             state = OptimizerStateRecord(target_id=target.id)
@@ -871,9 +940,11 @@ def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web,
         from app.db.models import OptimizerStateRecord
         assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.2"
 
-    monkeypatch.setattr(web_routes, "set_rewrite", lambda *_args, **_kwargs:
-                        {"healthy": False, "rolled_back": True,
-                         "verified_current_ip": "192.0.2.1"})
+    def rollback_verified(*_args, **_kwargs):
+        live_rewrite["ip"] = "192.0.2.1"
+        return {"healthy": False, "rolled_back": True, "verified_current_ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "set_rewrite", rollback_verified)
+    live_rewrite["ip"] = "192.0.2.1"
     failed = client.post(f"/targets/{target_id}/apply-best", data=form, follow_redirects=False)
     assert failed.status_code == 303 and failed.headers["location"].endswith(
         "?rewrite=rolled-back&verified_ip=192.0.2.1")
@@ -916,14 +987,10 @@ def test_add_to_dns_button_requires_absent_live_rewrite_and_healthy_best(web, mo
     client, database = web
     import app.web.routes as web_routes
     target_id, _ = _seed_add_dns_target(database)
-    class FakeAdGuard:
-        existing = None
-        def get_rewrite(self, _hostname): return self.existing
-        def close(self): pass
-    fake = FakeAdGuard()
-    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    live = {"ip": None}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (live["ip"], True))
     assert "Add to DNS" in client.get(f"/targets/{target_id}").text
-    fake.existing = {"domain": "add-dns.example", "answer": "192.0.2.44"}
+    live["ip"] = "192.0.2.44"
     assert "Add to DNS" not in client.get(f"/targets/{target_id}").text
 
 
@@ -936,10 +1003,7 @@ def test_add_to_dns_unavailable_current_best_healthy_is_visible_in_both_paths(we
         run = session.get(BenchmarkRunRecord, run_id)
         run.summary["resolution_failed"] = True
         run.summary["current_rewrite_lookup_succeeded"] = False
-    class FakeAdGuard:
-        def get_rewrite(self, _hostname): return None
-        def close(self): pass
-    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
     page = client.get("/targets").text if path_kind == "inline" else client.get(f"/targets/{target_id}").text
     assert "Unavailable" in page
     title_group = page.split('class="benchmark-result-top"', 1)[1].split('class="benchmark-result-ip"', 1)[0]
@@ -952,10 +1016,8 @@ def test_existing_rewrite_hides_add_and_synchronizes_from_targets_inline(web, mo
     import app.web.routes as web_routes
     from app.db.models import OptimizerStateRecord
     target_id, _ = _seed_add_dns_target(database)
-    class FakeAdGuard:
-        def get_rewrite(self, _hostname): return {"domain": "add-dns.example", "answer": "192.0.2.88"}
-        def close(self): pass
-    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: ("192.0.2.88", True))
     page = client.get("/targets").text
     assert ">Add to DNS</button>" not in page
     with database.session() as session:
@@ -972,10 +1034,7 @@ def test_add_to_dns_eligibility_hides_unhealthy_or_stale_in_both_pages(web, monk
     if stale:
         with database.session() as session:
             session.get(BenchmarkRunRecord, run_id).completed_at = utc_now() - timedelta(hours=2)
-    class FakeAdGuard:
-        def get_rewrite(self, _hostname): return None
-        def close(self): pass
-    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
     for page in (client.get("/targets").text, client.get(f"/targets/{target_id}").text):
         assert ">Add to DNS</button>" not in page
 
@@ -996,6 +1055,8 @@ def test_add_to_dns_creates_verifies_and_persists_once(web, monkeypatch):
         def close(self): pass
     fake = FakeAdGuard()
     monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: (fake.existing["answer"] if fake.existing else None, True))
     monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
     response = client.post(f"/targets/{target_id}/add-to-dns",
                            data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
@@ -1026,6 +1087,8 @@ def test_add_to_dns_duplicate_syncs_existing_ip_without_add(web, monkeypatch):
         def close(self): pass
     fake = FakeAdGuard()
     monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: ("192.0.2.55", True))
     monkeypatch.setattr(web_routes, "_healthy", lambda *_args: pytest.fail("duplicate must not create"))
     response = client.post(f"/targets/{target_id}/add-to-dns",
                            data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
@@ -1055,6 +1118,7 @@ def test_add_to_dns_blocks_unhealthy_or_stale_best(web, monkeypatch, healthy, st
         def close(self): pass
     fake = FakeAdGuard()
     monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
     monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
     response = client.post(f"/targets/{target_id}/add-to-dns",
                            data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
@@ -1072,6 +1136,7 @@ def test_add_to_dns_failure_does_not_persist_current_ip(web, monkeypatch):
         def add_rewrite(self, *_args): raise AdGuardError("failed")
         def close(self): pass
     monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
     monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
     response = client.post(f"/targets/{target_id}/add-to-dns",
                            data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
@@ -1114,12 +1179,17 @@ def test_apply_uses_verified_readback_instead_of_requested_ip(web, monkeypatch):
             DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip="192.0.2.2",
                            reason="Candidate is faster"))
         target_id, run_id = target.id, run.id
-    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    live = {"ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (live["ip"], True))
 
     def failed_with_verified_current(session, _target, *_args, **_kwargs):
         from app.db.models import OptimizerStateRecord
-        state = OptimizerStateRecord(target_id=target_id, current_rewrite_ip="192.0.2.9")
-        session.add(state)
+        state = session.get(OptimizerStateRecord, target_id)
+        if state is None:
+            state = OptimizerStateRecord(target_id=target_id)
+            session.add(state)
+        state.current_rewrite_ip = "192.0.2.9"
+        live["ip"] = "192.0.2.9"
         session.commit()
         return {"healthy": False, "rolled_back": False,
                 "verified_current_ip": "192.0.2.9"}

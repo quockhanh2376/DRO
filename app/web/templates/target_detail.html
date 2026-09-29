@@ -4,7 +4,7 @@
 <div class="page-heading"><div><p class="eyebrow">Target detail</p><h1>{{ target.hostname }}</h1></div><form method="post" action="/targets/{{ target.id }}/run" onsubmit="const b=this.querySelector('button'); b.disabled=true; b.textContent='Benchmark running…';"><input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}"><button class="button primary" type="submit">Run Now</button></form></div>
 <section class="panel target-detail-panel">
 <div class="target-detail-overview">
-<article class="target-detail-item"><span>Current rewrite</span><strong>{% set ip_value = state.current_rewrite_ip if state else latest.summary.get('current_rewrite_ip') if latest else None %}{% include "ip_copy.html" %}</strong></article>
+<article class="target-detail-item"><span>Current rewrite</span><strong>{% if authoritative_current_ip_succeeded %}{% set ip_value = authoritative_current_ip %}{% include "ip_copy.html" %}{% else %}<span class="unavailable-value">Unavailable</span>{% endif %}</strong></article>
 <article class="target-detail-item"><span>Best IP</span><strong>{% set ip_value = best.ip if best else None %}{% include "ip_copy.html" %}</strong></article>
 <article class="target-detail-item"><span>Pending winner</span><strong>{% set ip_value = state.pending_candidate_ip if state and state.pending_candidate_ip else None %}{% set unavailable = "None" %}{% include "ip_copy.html" %}</strong><small>{{ state.consecutive_wins if state else 0 }}/{{ target.required_consecutive_wins }} consecutive wins</small></article>
 <article class="target-detail-item"><span>Mode / status</span><strong>{{ target.mode }} · {{ "Enabled" if target.enabled else "Disabled" }}</strong></article>

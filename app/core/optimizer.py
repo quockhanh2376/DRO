@@ -13,7 +13,7 @@ from app.core.decision import DecisionEngine
 from app.core.discovery import DiscoveryError, PublicDnsDiscovery
 from app.db.models import TargetRecord
 from app.db.repositories import (
-    add_audit_event, get_current_rewrite_ip, get_pending_state, save_benchmark_run,
+    add_audit_event, get_pending_state, save_benchmark_run,
     save_optimizer_state,
 )
 from app.integrations.adguard import AdGuardError, configured_adguard_client
@@ -67,7 +67,6 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
     """Benchmark a target, persist its results/state, and return a secret-free summary."""
     config = Target.model_validate(record, from_attributes=True)
     pending = get_pending_state(session, record.id)
-    stored_current_ip = get_current_rewrite_ip(session, record.id)
     discovery = PublicDnsDiscovery()
     discovery_error = None
     try:
@@ -82,7 +81,9 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
 
     resolved_current_ip, lookup_succeeded = read_adguard_rewrite(config.hostname)
     if not lookup_succeeded:
-        resolved_current_ip = stored_current_ip
+        # A cached value is not authoritative. Keep Current Rewrite unavailable until
+        # AdGuard can be read again; discovered public candidates remain separate.
+        resolved_current_ip = None
     resolution_failed = not public_ips
     logger.info("Benchmark DNS discovery host=%s candidates=%s current_rewrite_ip=%s",
                 config.hostname, public_ips, resolved_current_ip)

@@ -99,46 +99,36 @@ def _dashboard_rows(session: Session) -> list[dict]:
 
 
 def _add_to_dns_eligibility(session: Session, target: TargetRecord, run=None) -> dict:
-    """Resolve Add to DNS visibility and synchronize any live existing rewrite."""
+    """Resolve eligibility and the current rewrite from the authoritative AdGuard read."""
     runs = list_benchmark_runs(session, target.id)
     latest = get_benchmark_run(session, runs[0].id) if runs else None
     if run is not None and (latest is None or latest.id != run.id):
-        return {"latest": latest, "best": _best_benchmark_result(latest), "can_add_to_dns": False}
+        run = latest
     latest = latest or run
     best = _best_benchmark_result(latest)
-    if (not latest or not target.enabled or not best or not best.healthy or not best.ip
-            or best.average_ms is None):
-        return {"latest": latest, "best": best, "can_add_to_dns": False}
-    try:
-        best.ip = str(ipaddress.IPv4Address(best.ip))
-    except ipaddress.AddressValueError:
-        return {"latest": latest, "best": best, "can_add_to_dns": False}
-    age = datetime.now(timezone.utc) - latest.completed_at.replace(tzinfo=timezone.utc)
-    if age < timedelta(0) or age > ADD_BEST_MAX_AGE:
-        return {"latest": latest, "best": best, "can_add_to_dns": False}
-    try:
-        client = configured_adguard_client()
-        try:
-            existing = client.get_rewrite(target.hostname)
-        finally:
-            client.close()
-    except Exception as exc:
-        logger.warning("Add to DNS eligibility rewrite lookup failed target_id=%d error=%s",
-                       target.id, type(exc).__name__)
-        return {"latest": latest, "best": best, "can_add_to_dns": False}
-    if existing is not None:
-        try:
-            existing_ip = str(ipaddress.IPv4Address(existing["answer"]))
-        except (KeyError, ValueError):
-            existing_ip = None
+    current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+    if lookup_succeeded:
         state = session.get(OptimizerStateRecord, target.id)
         if state is None:
             state = OptimizerStateRecord(target_id=target.id)
             session.add(state)
-        state.current_rewrite_ip = existing_ip
+        state.current_rewrite_ip = current_ip
         session.commit()
-        return {"latest": latest, "best": best, "can_add_to_dns": False}
-    return {"latest": latest, "best": best, "can_add_to_dns": True}
+    result = {"latest": latest, "best": best, "can_add_to_dns": False,
+              "current_ip": current_ip if lookup_succeeded else None,
+              "current_rewrite_lookup_succeeded": lookup_succeeded}
+    if (not latest or not target.enabled or not best or not best.healthy or not best.ip
+            or best.average_ms is None):
+        return result
+    try:
+        best.ip = str(ipaddress.IPv4Address(best.ip))
+    except ipaddress.AddressValueError:
+        return result
+    age = datetime.now(timezone.utc) - latest.completed_at.replace(tzinfo=timezone.utc)
+    if age < timedelta(0) or age > ADD_BEST_MAX_AGE:
+        return result
+    result["can_add_to_dns"] = bool(lookup_succeeded and current_ip is None)
+    return result
 
 
 def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, tuple]:
@@ -155,7 +145,9 @@ def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, 
         if run.target_id not in latest_runs:
             target = targets_by_id[run.target_id]
             eligibility = _add_to_dns_eligibility(session, target, run)
-            latest_runs[run.target_id] = (run, eligibility["best"], eligibility["can_add_to_dns"])
+            latest_runs[run.target_id] = (run, eligibility["best"], eligibility["can_add_to_dns"],
+                                          eligibility["current_ip"],
+                                          eligibility["current_rewrite_lookup_succeeded"])
     return latest_runs
 
 
@@ -371,8 +363,10 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
     eligibility = _add_to_dns_eligibility(session, target, latest)
     return templates.TemplateResponse(request, "target_detail.html", _base_context(
         request, target=target, latest=latest, state=state, current=current, best=best,
-        current_ip_override=(state.current_rewrite_ip if state else
-                             latest.summary.get("current_rewrite_ip") if latest else None),
+        current_ip_override=eligibility["current_ip"],
+        current_rewrite_lookup_succeeded_override=eligibility["current_rewrite_lookup_succeeded"],
+        authoritative_current_ip=eligibility["current_ip"],
+        authoritative_current_ip_succeeded=eligibility["current_rewrite_lookup_succeeded"],
         rewrite_result=request.query_params.get("rewrite"),
         rewrite_old_ip=request.query_params.get("old_ip"),
         rewrite_new_ip=request.query_params.get("new_ip"),
@@ -409,7 +403,9 @@ def run_target_now(target_id: int, request: Request, session: Session = Depends(
         eligibility = _add_to_dns_eligibility(session, target, latest)
         return templates.TemplateResponse(request, "run_state.html", _base_context(
             request, target=target, run_status=run_status, queue_position=queue_position,
-            latest=latest, best=eligibility["best"], can_add_to_dns=eligibility["can_add_to_dns"]))
+            latest=latest, best=eligibility["best"], can_add_to_dns=eligibility["can_add_to_dns"],
+            current_ip_override=eligibility["current_ip"],
+            current_rewrite_lookup_succeeded_override=eligibility["current_rewrite_lookup_succeeded"]))
     return RedirectResponse(f"/targets/{target_id}", status_code=303)
 
 
@@ -423,8 +419,6 @@ def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Fo
                 target_id, target.hostname, new_ip)
     if not confirm:
         raise HTTPException(status_code=400, detail="Explicit rewrite confirmation is required")
-    logger.info("manual_apply_started hostname=%s old_ip=%s new_ip=%s run_id=%s",
-                target.hostname, old_ip, new_ip, run_id)
     run = get_benchmark_run(session, run_id)
     runs = list_benchmark_runs(session, target_id)
     if not run or run.target_id != target_id or not runs or runs[0].id != run_id:
@@ -433,31 +427,48 @@ def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Fo
                          "reason": "stale_benchmark"})
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=stale", status_code=303)
-    if (run.summary.get("resolution_failed")
-            or not run.summary.get("current_rewrite_lookup_succeeded")
-            or run.summary.get("current_rewrite_ip") != old_ip):
+    if run.summary.get("resolution_failed"):
         add_audit_event(session, "manual_apply_failed", target_id,
                         {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
-                         "reason": "current_rewrite_unverified"})
+                         "reason": "benchmark_unavailable"})
         session.commit()
-        return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=current", status_code=303)
+        return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=candidate", status_code=303)
     best = _best_benchmark_result(run)
-    if not best or not best.healthy or best.ip != new_ip or best.ip == old_ip:
+    benchmark_age = datetime.now(timezone.utc) - run.completed_at.replace(tzinfo=timezone.utc)
+    try:
+        best_ip = str(ipaddress.IPv4Address(best.ip)) if best and best.healthy else None
+        selected_ip = str(ipaddress.IPv4Address(new_ip))
+    except ipaddress.AddressValueError:
+        best_ip = selected_ip = None
+    if (benchmark_age < timedelta(0) or benchmark_age > ADD_BEST_MAX_AGE
+            or not best or not best.healthy or best_ip is None or selected_ip != best_ip):
         add_audit_event(session, "manual_apply_failed", target_id,
                         {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
                          "reason": "candidate_unhealthy_or_stale"})
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=candidate", status_code=303)
+    new_ip = best_ip
     live_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
-    if not lookup_succeeded or live_ip != old_ip:
-        if lookup_succeeded:
-            _persist_verified_current_ip(session, target_id, live_ip)
+    if lookup_succeeded:
+        _persist_verified_current_ip(session, target_id, live_ip)
+    if not lookup_succeeded or live_ip is None:
         add_audit_event(session, "manual_apply_failed", target_id,
                         {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
                          "verified_current_ip": live_ip if lookup_succeeded else None,
-                         "reason": "current_rewrite_changed_or_unavailable"})
+                         "reason": "current_rewrite_unavailable"})
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=current", status_code=303)
+    # The hidden old_ip is presentation only; AdGuard's normalized current read wins.
+    old_ip = live_ip
+    if new_ip == old_ip:
+        _persist_verified_current_ip(session, target_id, live_ip)
+        add_audit_event(session, "manual_apply_failed", target_id,
+                        {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
+                         "reason": "candidate_is_current_rewrite"})
+        session.commit()
+        return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=candidate", status_code=303)
+    logger.info("manual_apply_started hostname=%s old_ip=%s new_ip=%s run_id=%s",
+                target.hostname, old_ip, new_ip, run_id)
     try:
         outcome = set_rewrite(session, target, new_ip, "Manual Apply Best IP", run_id,
                               expected_old_ip=old_ip)

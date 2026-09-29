@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import ipaddress
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
@@ -23,14 +24,15 @@ def _adguard_client() -> AdGuardClient:
     return configured_adguard_client()
 
 
-def _write(client: AdGuardClient, hostname: str, old_ip: str | None, new_ip: str | None) -> None:
+def _write(client: AdGuardClient, hostname: str, old_ip: str | None, new_ip: str | None,
+           old_domain: str | None = None) -> None:
     if old_ip == new_ip:
         return
     if new_ip is None:
         if old_ip:
             client.delete_rewrite(hostname, old_ip)
     elif old_ip:
-        client.update_rewrite(hostname, old_ip, hostname, new_ip)
+        client.update_rewrite(old_domain or hostname, old_ip, hostname, new_ip)
     else:
         client.add_rewrite(hostname, new_ip)
 
@@ -51,7 +53,8 @@ def _restore_rewrite(client: AdGuardClient, hostname: str,
     current = client.get_rewrite(hostname)
     current_ip = current.get("answer") if current else None
     if current_ip != old_ip:
-        _write(client, hostname, current_ip, old_ip)
+        _write(client, hostname, current_ip, old_ip,
+               old_domain=current.get("domain") if current else hostname)
     restored = client.get_rewrite(hostname)
     verified_ip = restored.get("answer") if restored else None
     return verified_ip == old_ip, verified_ip
@@ -73,12 +76,18 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                 automatic: bool = False, expected_old_ip: str | None = None) -> dict:
     """Write a rewrite, verify it from this host, and immediately restore on failed health."""
     target = Target.model_validate(record, from_attributes=True)
+    hostname = target.hostname.rstrip(".").casefold()
     client = _adguard_client()
     old_ip: str | None = None
     mutation_started = False
     try:
-        existing = client.get_rewrite(target.hostname)
+        existing = client.get_rewrite(hostname)
         old_ip = existing.get("answer") if existing else None
+        if old_ip is not None:
+            try:
+                old_ip = str(ipaddress.IPv4Address(old_ip))
+            except ipaddress.AddressValueError as exc:
+                raise AdGuardError("AdGuard current rewrite is not a valid IPv4 address") from exc
         if expected_old_ip is not None and old_ip != expected_old_ip:
             raise AdGuardError("AdGuard rewrite changed since the benchmark")
         if old_ip == new_ip:
@@ -95,10 +104,11 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                               method="PUT", endpoint="/control/rewrite/update",
                               target_domain=target.hostname, target_answer=old_ip,
                               update_domain=target.hostname, update_answer=new_ip)
-        _write(client, target.hostname, old_ip, new_ip)
-        rewrite_verified = _rewrite_is(client, target.hostname, new_ip)
+        _write(client, hostname, old_ip, new_ip,
+               old_domain=existing.get("domain") if existing else hostname)
+        rewrite_verified = _rewrite_is(client, hostname, new_ip)
         if reason == "Manual Apply Best IP":
-            readback = client.get_rewrite(target.hostname)
+            readback = client.get_rewrite(hostname)
             actual_ip = readback.get("answer") if readback else None
             _manual_apply_log("readback", target.hostname, old_ip, new_ip,
                               verified=rewrite_verified, actual_ip=actual_ip)
@@ -124,7 +134,7 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
             return {"changed": True, "old_ip": old_ip, "new_ip": new_ip,
                     "verified_current_ip": new_ip, "healthy": healthy}
 
-        restored, verified_current_ip = _restore_rewrite(client, target.hostname, old_ip)
+        restored, verified_current_ip = _restore_rewrite(client, hostname, old_ip)
         mutation_started = False
         if rewrite_verified and restored:
             # History is a record of verified DNS transitions, never an unconfirmed write.
@@ -163,7 +173,7 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                          target.hostname, type(database_rollback_error).__name__)
         if mutation_started:
             try:
-                _restore_rewrite(client, target.hostname, old_ip)
+                _restore_rewrite(client, hostname, old_ip)
             except Exception as rollback_error:
                 logger.critical("Compensating rewrite failed host=%s error=%s",
                                 target.hostname, type(rollback_error).__name__)
