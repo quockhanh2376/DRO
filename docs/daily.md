@@ -115,3 +115,12 @@
 - Measured top costs: HTTPS/curl sample work (5.77–14.46 s per target); local unavailable-AdGuard lookup (2.50–2.74 s, environment-specific); curl process/wrapper delta estimate 57–75 ms/sample. DoH was 115–158 ms; log handlers, DB transaction, and `summarize()` were negligible.
 - No runtime optimization was justified: concurrency risks benchmark distortion; curl batching/replacement risks TLS/retry/timeout/error semantics; other measured costs were small. No DNS was changed.
 - Validation: full pytest passed (result recorded in the audit report). Production was not accessed or changed.
+
+## 2026-09-29 - Native benchmark client experiment
+
+- Created `experiment/native-benchmark-client` from `origin/main` at `8f702dc066e953a1afeb5282643cf6fcc2643c1f`; the production/default runner remains curl. Added an opt-in standard-library native HTTPS prototype with direct candidate-IP socket pinning, original-host SNI/verification, HTTP/1.1, a total deadline, accepted 200-399 status policy, no redirect following, and one connection per sample.
+- Added local TLS regression tests for CA and hostname verification, SNI/Host, fresh connections, redirects/status, read and total timeouts, refused/reset error classification, and an assertion that curl stays the default with its timing fields. Focused native/audit suite: 9 passed.
+- Five paired network repeats per case used the same discovered IPs for both clients. Every one of 500 samples per client was valid. Batch medians (curl/native): A 5.859/7.118 s; B 14.938/15.220 s; C 7.431/7.595 s. Native was slower in all cases; its best-IP ranking agreed with curl in 6 of 20 matched target-run comparisons.
+- Per-case total CPU (curl parent + curl children / native process) was A 2.750/2.859 s, B 5.921/5.344 s, C 5.531/5.312 s. Shared Python high-water RSS was about 43-50 MiB; individual curl children peaked at about 8.3 MiB. There was no consistent performance win.
+- Recommendation: keep curl. Windows Schannel revocation fallback and platform trust-backend differences remain relevant; subprocess elimination did not justify slower/unstable benchmark results. See `docs/performance-native-client-experiment.md`.
+- Full pytest: 167 passed, 4 skipped, 1 upstream Starlette/httpx deprecation warning. No production deploy, DNS rewrite, DB change, or merge was performed.
