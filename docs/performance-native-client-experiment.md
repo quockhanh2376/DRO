@@ -47,21 +47,22 @@ parent CPU plus measured curl-child CPU where applicable. RSS reports the
 Python process high-water mark and the largest individual curl child working
 set separately; these are not a simultaneous aggregate peak.
 
-| Case | Client | Median batch wall | Median candidate work | Samples valid | Python CPU total | Curl child CPU total | Parent peak RSS* | Largest curl child RSS* |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A: 1 target, 2 IPs × 10 | curl | 5,859 ms | 5,859 ms | 100/100 | 203 ms | 2,547 ms | 43.2 MiB | 8.3 MiB |
-| A | native | 7,118 ms (+21.5%) | 7,118 ms | 100/100 | 2,859 ms | 0 | 43.3 MiB | — |
-| B: 1 target, 4 IPs × 10 | curl | 14,938 ms | 14,938 ms | 200/200 | 812 ms | 5,109 ms | 46.2 MiB | 8.3 MiB |
-| B | native | 15,220 ms (+1.9%) | 15,219 ms | 200/200 | 5,344 ms | 0 | 45.7 MiB | — |
-| C: 2 targets concurrently, 2 IPs × 10 each | curl | 7,431 ms | 6,658 ms / target | 200/200 | 609 ms | 4,922 ms | 50.0 MiB | 8.3 MiB |
-| C | native | 7,595 ms (+2.2%) | 7,331 ms / target | 200/200 | 5,312 ms | 0 | 50.2 MiB | — |
+| Case | Client | Median batch wall | Median candidate work | Samples valid | Curl subprocesses | Python CPU total | Curl child CPU total | Parent peak RSS* | Largest curl child RSS* |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A: 1 target, 2 IPs × 10 | curl | 5,859 ms | 5,859 ms | 100/100 | 100 | 203 ms | 2,547 ms | 43.2 MiB | 8.3 MiB |
+| A | native | 7,118 ms (+21.5%) | 7,118 ms | 100/100 | 0 | 2,859 ms | 0 | 43.3 MiB (+0.1) | — |
+| B: 1 target, 4 IPs × 10 | curl | 14,938 ms | 14,938 ms | 200/200 | 200 | 812 ms | 5,109 ms | 46.2 MiB | 8.3 MiB |
+| B | native | 15,220 ms (+1.9%) | 15,219 ms | 200/200 | 0 | 5,344 ms | 0 | 45.7 MiB (-0.5) | — |
+| C: 2 targets concurrently, 2 IPs × 10 each | curl | 7,431 ms | 6,658 ms / target | 200/200 | 200 | 609 ms | 4,922 ms | 50.0 MiB | 8.3 MiB |
+| C | native | 7,595 ms (+2.2%) | 7,331 ms / target | 200/200 | 0 | 5,312 ms | 0 | 50.2 MiB (+0.2) | — |
 
 *Memory is sampled from one shared Windows Python process across all runs, so
 the Python parent peak is a process high-water mark rather than an isolated
 per-client comparison. Curl child peak is measured per curl process. Case C's
 simultaneous aggregate parent-plus-child peak was not measured. Curl's parent
 and child CPU are both included in total CPU; native CPU is in the Python
-process. Totals cover five repeats of the case.
+process. Each native sample instead creates one socket in-process (100/200/200
+by case). Totals cover five repeats of the case.
 
 Across all samples, median `(TCP connect, TLS, total)` milliseconds were:
 
@@ -74,8 +75,12 @@ Across all samples, median `(TCP connect, TLS, total)` milliseconds were:
 The native client used substantially more Python-parent CPU (about 2.9–14×
 the curl parent depending on case). Once curl child CPU is included, total CPU
 is close: A 2,750 ms curl / 2,859 ms native; B
-5,921 / 5,344 ms; C 5,531 / 5,312 ms. It did not yield a consistent throughput
-gain. Every sample was valid for both clients (500 per client); there were no
+5,921 / 5,344 ms; C 5,531 / 5,312 ms. Native-minus-curl CPU deltas were A
++109 ms (+4.0%), B -577 ms (-9.7%), and C -219 ms (-4.0%); there was no
+consistent CPU win. Observed parent-RSS deltas were A +0.1 MiB, B -0.5 MiB,
+and C +0.2 MiB, but the shared-process high-water limitation above means these
+are not isolated memory deltas. Curl also used up to 8.3 MiB per child process.
+Every sample was valid for both clients (500 per client); there were no
 timeouts or rejected statuses in this measurement window.
 
 ### Candidate sets and ranking stability
@@ -86,10 +91,14 @@ first two for A and C and the first four for B:
 - `example.com`: `172.66.147.243`, `104.20.23.154`
 - `www.google.com`: `142.251.157.119`, `142.251.156.119`, `142.251.152.119`, `142.251.155.119`
 
-Paired best-IP agreement by repeat was A 3/5, B 1/5, and C 2/10 target-run
-pairs. Candidate timing is close enough that the selected winner often changed
-between adjacent repeats; the experiment does not show stable ranking
-equivalence for candidates whose latency is similar.
+Paired best-IP agreement was A 3/5 (60%), B 1/5 (20%), and C 2/10 (20% across
+both targets), 6/20 (30%) overall. Individual client winners also varied across
+repeats rather than repeatedly preferring one endpoint. This pattern is
+consistent with network noise among close-latency candidates, not evidence of
+a consistent ranking reversal. However, the low paired agreement means ranking
+equivalence was not demonstrated. The native client's higher total-time
+medians were consistent across cases, so its latency offset is systematic in
+this run even though winner disagreement is not.
 
 Candidate ranking uses DRO's existing `rank_candidates` order (healthy only,
 average then median then jitter). Timing-based winner differences are expected
