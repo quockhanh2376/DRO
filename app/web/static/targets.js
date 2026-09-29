@@ -23,6 +23,41 @@ document.addEventListener("click", async (event) => {
   }
 });
 
+const searchForm = document.getElementById("target-search-form");
+if (searchForm) {
+  const searchInput = document.getElementById("target-search-input");
+  const clearButton = document.getElementById("target-search-clear");
+  const message = document.getElementById("target-search-message");
+  const targets = Array.from(document.querySelectorAll(".target-primary-row"));
+  searchForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = searchInput.value.trim().toLocaleLowerCase();
+    message.textContent = "";
+    if (!query) {
+      searchInput.focus();
+      return;
+    }
+    const exact = targets.filter((row) => row.dataset.hostname.trim().toLocaleLowerCase() === query);
+    const matches = exact.length ? exact : targets.filter((row) => row.dataset.hostname.toLocaleLowerCase().includes(query));
+    if (!matches.length) {
+      message.textContent = "No matching domain found.";
+      return;
+    }
+    const row = matches[0];
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
+    row.classList.remove("target-search-highlight");
+    void row.offsetWidth;
+    row.classList.add("target-search-highlight");
+    window.setTimeout(() => row.classList.remove("target-search-highlight"), 2200);
+    if (matches.length > 1) message.textContent = `${matches.length} matches found; showing first.`;
+  });
+  clearButton.addEventListener("click", () => {
+    searchInput.value = "";
+    message.textContent = "";
+    searchInput.focus();
+  });
+}
+
 document.addEventListener("htmx:afterSwap", () => {
   document.querySelectorAll(".ping-console-output").forEach((output) => {
     output.scrollTop = output.scrollHeight;

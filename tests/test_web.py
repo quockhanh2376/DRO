@@ -148,6 +148,34 @@ def test_targets_form_is_compact_and_actions_are_play_edit_delete(web):
     assert 'navigator.clipboard.writeText(value)' in client.get("/static/targets.js").text
 
 
+def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
+    client, database = web
+    with database.session() as session:
+        z_target = save_target(session, Target(hostname="zulu.example"))
+        m_target = save_target(session, Target(hostname="Myob.com"))
+        a_target = save_target(session, Target(hostname="accounts.intuit.com"))
+        ids = {"zulu.example": z_target.id, "myob.com": m_target.id,
+               "accounts.intuit.com": a_target.id}
+    page = client.get("/targets").text
+    blocks = re.findall(r'<tr id="target-block-(\d+)" class="target-primary-row" data-target-id="\d+" data-hostname="([^"]+)"', page)
+    assert [hostname for _target_id, hostname in blocks] == [
+        "accounts.intuit.com", "myob.com", "zulu.example"]
+    assert [int(re.search(r'<td class="target-sequence">(\d+)</td>',
+                          page.split(f'id="target-block-{target_id}"', 1)[1].split("</tr>", 1)[0]).group(1))
+            for target_id, _hostname in blocks] == [1, 2, 3]
+    for hostname, target_id in ids.items():
+        assert f'id="target-block-{target_id}"' in page
+        assert f'data-hostname="{hostname}"' in page
+    assert 'id="target-search-input"' in page and 'type="search"' in page
+    assert 'id="target-search-clear"' in page and 'title="Clear search"' in page
+    assert 'id="target-search-message"' in page and 'role="status"' in page
+    script = client.get("/static/targets.js").text
+    assert 'No matching domain found.' in script
+    assert 'matches found; showing first.' in script
+    assert 'scrollIntoView({ behavior: "smooth", block: "center" })' in script
+    assert 'searchInput.focus()' in script and 'searchInput.value = ""' in script
+
+
 def test_target_form_rejects_url_syntax_and_normalizes_hostname(web):
     client, database = web
     rejected = client.post("/targets", data={"hostname": "https://example.com"})

@@ -166,10 +166,13 @@ def dashboard(request: Request, session: Session = Depends(get_session)):
 
 @router.get("/targets", response_class=HTMLResponse, name="targets_page", dependencies=[Depends(require_admin)])
 def targets_page(request: Request, session: Session = Depends(get_session)):
-    targets = list_targets(session)
+    targets = sorted(list_targets(session), key=lambda target: target.hostname.casefold())
     latest_runs = _latest_run_map(session, targets)
     return templates.TemplateResponse(request, "targets.html",
-                                      _base_context(request, targets=targets, latest_runs=latest_runs, target=None,
+                                      _base_context(request, targets=targets,
+                                                    target_rows=[{"target": item, "sequence": index}
+                                                                 for index, item in enumerate(targets, 1)],
+                                                    latest_runs=latest_runs, target=None,
                                                     errors=None,
                                                     default_interval_hours=default_interval_hours(session)))
 

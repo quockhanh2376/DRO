@@ -25,14 +25,23 @@
   </form>
 </section>
 <script src="/static/targets.js" defer></script>
+<form class="target-search" id="target-search-form" role="search">
+  <label class="sr-only" for="target-search-input">Search domains</label>
+  <input id="target-search-input" type="search" autocomplete="off" placeholder="Search hostname or domain">
+  <button class="target-search-clear" type="button" id="target-search-clear" title="Clear search" aria-label="Clear search">×</button>
+  <button class="button primary" type="submit">Search</button>
+  <span id="target-search-message" class="target-search-message" role="status" aria-live="polite"></span>
+</form>
 <section class="table-wrap">
   <table>
-    <thead><tr><th>Hostname</th><th>Enabled</th><th>Auto Apply</th><th>Interval</th><th>Runs/IP</th><th>Threshold</th><th>Actions</th><th aria-label="Activity"></th></tr></thead>
+    <thead><tr><th aria-label="Sequence">#</th><th>Hostname</th><th>Enabled</th><th>Auto Apply</th><th>Interval</th><th>Runs/IP</th><th>Threshold</th><th>Actions</th><th aria-label="Activity"></th></tr></thead>
     <tbody>
-    {% for item in targets %}
+    {% for target_row in target_rows|default([]) %}
+      {% set item = target_row.target %}
       {% set target = item %}
       {% set run_status, queue_position = request.app.state.run_coordinator.state(item.id) %}
-      <tr>
+      <tr id="target-block-{{ item.id }}" class="target-primary-row" data-target-id="{{ item.id }}" data-hostname="{{ item.hostname }}">
+        <td class="target-sequence">{{ target_row.sequence }}</td>
         <td><a href="/targets/{{ item.id }}">{{ item.hostname }}</a><button class="copy-button" type="button" data-copy="{{ item.hostname }}" title="Copy hostname" aria-label="Copy hostname"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8V4h12v12h-4M4 8h12v12H4z"/></svg></button></td>
         <td>{{ "Yes" if item.enabled else "No" }}</td><td><form method="post" action="/targets/{{ item.id }}/auto-apply" class="auto-apply-form"><input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}"><input type="hidden" name="enabled" value="{{ 'false' if item.auto_apply else 'true' }}"><button class="button auto-apply-toggle {{ 'on' if item.auto_apply else 'off' }}" type="submit" aria-pressed="{{ 'true' if item.auto_apply else 'false' }}" title="{{ 'Disable' if item.auto_apply else 'Enable' }} Auto Apply">{{ "On" if item.auto_apply else "Off" }}</button></form></td><td>{{ item.interval_hours }}h</td>
         <td>{{ item.runs_per_ip }}</td><td>{{ item.switch_threshold_ms }}ms / {{ item.switch_threshold_percent }}%</td>
@@ -51,10 +60,10 @@
         </td>
         <td class="activity-cell"><span id="ping-start-indicator-{{ item.id }}" class="activity-spinner ping-spinner htmx-indicator" role="status" aria-label="Starting ping" title="Starting ping"></span><div id="ping-status-{{ item.id }}"></div><div id="run-state-poll-{{ item.id }}" hx-get="/targets/{{ item.id }}/run/state" hx-trigger="load, every 1s" hx-target="this" hx-swap="innerHTML" hx-sync="this:replace">{% if run_status == 'running' %}<span id="run-state-indicator-{{ item.id }}" class="activity-spinner benchmark-spinner" role="status" aria-label="Benchmark running" title="Benchmark running"></span>{% elif run_status == 'queued' %}<span class="queued-state" role="status">Queued #{{ queue_position }}</span>{% endif %}</div></td>
       </tr>
-      <tr class="ping-row"><td colspan="8"><div id="ping-result-{{ item.id }}" aria-live="polite" hx-get="/targets/{{ item.id }}/ping/output" hx-trigger="load, every 1s" hx-target="this" hx-swap="innerHTML" hx-sync="this:replace"></div></td></tr>
+      <tr class="ping-row"><td colspan="9"><div id="ping-result-{{ item.id }}" aria-live="polite" hx-get="/targets/{{ item.id }}/ping/output" hx-trigger="load, every 1s" hx-target="this" hx-swap="innerHTML" hx-sync="this:replace"></div></td></tr>
       {% set latest_pair = latest_runs.get(item.id) %}{% set latest = latest_pair[0] if latest_pair else None %}{% set best = latest_pair[1] if latest_pair else None %}{% set can_add_to_dns = latest_pair[2] if latest_pair and latest_pair|length > 2 else false %}
-      <tr class="run-result-row"><td colspan="8"><div id="run-result-{{ item.id }}" aria-live="polite">{% if latest %}{% include "benchmark_result.html" %}{% endif %}</div></td></tr>
-    {% else %}<tr><td colspan="8" class="empty">No targets configured.</td></tr>{% endfor %}
+      <tr class="run-result-row"><td colspan="9"><div id="run-result-{{ item.id }}" aria-live="polite">{% if latest %}{% include "benchmark_result.html" %}{% endif %}</div></td></tr>
+    {% else %}<tr><td colspan="9" class="empty">No targets configured.</td></tr>{% endfor %}
     </tbody>
   </table>
 </section>
