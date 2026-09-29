@@ -796,6 +796,16 @@ def test_apply_uses_live_adguard_rewrite_when_dro_cache_and_benchmark_are_stale(
     refreshed = client.get(response.headers["location"]).text
     assert "DNS rewrite updated: 108.157.32.65 -&gt; 108.157.32.2" in refreshed
     assert 'class="ip-copy-value">108.157.32.2' in refreshed
+    assert f'action="/targets/{target_id}/apply-best"' not in refreshed
+    second = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "108.157.32.65", "new_ip": "108.157.32.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert second.status_code == 303
+    assert second.headers["location"].endswith("?rewrite=already-applied&ip=108.157.32.2")
+    already = client.get(second.headers["location"]).text
+    assert "DNS rewrite already uses Best IP: 108.157.32.2" in already
+    assert f'action="/targets/{target_id}/apply-best"' not in already
+    assert len(fake.update_calls) == 1
     with database.session() as session:
         state = session.get(OptimizerStateRecord, target_id)
         assert state.current_rewrite_ip == fake.current == "108.157.32.2"
@@ -803,6 +813,106 @@ def test_apply_uses_live_adguard_rewrite_when_dro_cache_and_benchmark_are_stale(
             RewriteHistoryRecord.target_id == target_id)).all()
         assert len(history) == 1
         assert (history[0].old_ip, history[0].new_ip) == ("108.157.32.65", "108.157.32.2")
+
+
+def test_true_external_rewrite_change_after_route_read_conflicts_and_syncs(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="conflict.example"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="192.0.2.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "192.0.2.1", "current_rewrite_lookup_succeeded": True},
+            DecisionResult(action="UPDATE", candidate_ip="192.0.2.2", reason="Healthy best"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="192.0.2.1"))
+        session.commit()
+
+    class ChangedAdGuard:
+        current = "192.0.2.3"
+        writes = 0
+        def get_rewrite(self, _hostname): return {"domain": "conflict.example", "answer": self.current}
+        def update_rewrite(self, *_args): self.writes += 1
+        def add_rewrite(self, *_args): self.writes += 1
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = ChangedAdGuard()
+    reads = iter([("192.0.2.1", True)])
+    def route_read(_hostname):
+        return next(reads, (fake.current, True))
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", route_read)
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].endswith("?rewrite=conflict&verified_ip=192.0.2.3")
+    assert fake.writes == 0
+    page = client.get(response.headers["location"]).text
+    assert "DNS rewrite changed externally; refreshed current state." in page
+    assert 'class="ip-copy-value">192.0.2.3' in page
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.3"
+        assert not session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+
+
+def test_race_to_selected_best_before_service_compare_is_idempotent(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="concurrent-apply.example"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="192.0.2.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"resolution_failed": False},
+            DecisionResult(action="UPDATE", candidate_ip="192.0.2.2", reason="Healthy best"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="192.0.2.1"))
+        session.commit()
+
+    class AlreadyChangedAdGuard:
+        current = "192.0.2.2"
+        writes = 0
+        def get_rewrite(self, hostname): return {"domain": hostname, "answer": self.current}
+        def update_rewrite(self, *_args): self.writes += 1
+        def add_rewrite(self, *_args): self.writes += 1
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = AlreadyChangedAdGuard()
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert response.headers["location"].endswith("?rewrite=already-applied&ip=192.0.2.2")
+    assert fake.writes == 0
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.2"
+        assert not session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+
+
+def test_apply_submit_disables_button_and_prevents_double_submit():
+    from pathlib import Path
+    base = (Path(__file__).parents[1] / "app/web/templates/base.html").read_text(encoding="utf-8")
+    script = (Path(__file__).parents[1] / "app/web/static/apply.js").read_text(encoding="utf-8")
+    assert '<script src="/static/apply.js" defer></script>' in base
+    assert 'form.matches(".apply-best-form")' in script
+    assert 'form.dataset.applying === "true"' in script
+    assert "event.preventDefault()" in script
+    assert "button.disabled = true" in script
+    assert 'button.setAttribute("aria-busy", "true")' in script
+    assert "Applying..." in script
 
 
 def test_inline_and_standalone_share_apply_button_template(web):

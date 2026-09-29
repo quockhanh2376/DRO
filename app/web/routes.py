@@ -370,6 +370,7 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
         rewrite_result=request.query_params.get("rewrite"),
         rewrite_old_ip=request.query_params.get("old_ip"),
         rewrite_new_ip=request.query_params.get("new_ip"),
+        rewrite_ip=request.query_params.get("ip"),
         rewrite_verified_ip=request.query_params.get("verified_ip"),
         rewrite_reason=request.query_params.get("reason"),
         can_add_to_dns=eligibility["can_add_to_dns"],
@@ -419,6 +420,19 @@ def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Fo
                 target_id, target.hostname, new_ip)
     if not confirm:
         raise HTTPException(status_code=400, detail="Explicit rewrite confirmation is required")
+    live_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+    logger.info("manual_apply_authoritative_read hostname=%s submitted_old_ip=%s authoritative_current_ip=%s lookup_succeeded=%s",
+                target.hostname, old_ip, live_ip, lookup_succeeded)
+    if lookup_succeeded:
+        _persist_verified_current_ip(session, target_id, live_ip)
+    if not lookup_succeeded:
+        add_audit_event(session, "manual_apply_failed", target_id,
+                        {"hostname": target.hostname, "submitted_old_ip": old_ip,
+                         "new_ip": new_ip, "reason": "current_rewrite_unavailable"})
+        session.commit()
+        logger.warning("manual_apply_failed hostname=%s old_ip=%s new_ip=%s reason=current_rewrite_unavailable",
+                       target.hostname, old_ip, new_ip)
+        return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=current", status_code=303)
     run = get_benchmark_run(session, run_id)
     runs = list_benchmark_runs(session, target_id)
     if not run or run.target_id != target_id or not runs or runs[0].id != run_id:
@@ -448,65 +462,93 @@ def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Fo
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=candidate", status_code=303)
     new_ip = best_ip
-    live_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
-    if lookup_succeeded:
-        _persist_verified_current_ip(session, target_id, live_ip)
-    if not lookup_succeeded or live_ip is None:
+    if live_ip is None:
         add_audit_event(session, "manual_apply_failed", target_id,
-                        {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
-                         "verified_current_ip": live_ip if lookup_succeeded else None,
-                         "reason": "current_rewrite_unavailable"})
+                        {"hostname": target.hostname, "submitted_old_ip": old_ip, "new_ip": new_ip,
+                         "reason": "current_rewrite_absent"})
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=current", status_code=303)
-    # The hidden old_ip is presentation only; AdGuard's normalized current read wins.
-    old_ip = live_ip
-    if new_ip == old_ip:
-        _persist_verified_current_ip(session, target_id, live_ip)
-        add_audit_event(session, "manual_apply_failed", target_id,
-                        {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
-                         "reason": "candidate_is_current_rewrite"})
+    # The hidden old_ip is context only. AdGuard's normalized read is the baseline.
+    authoritative_old_ip = live_ip
+    if authoritative_old_ip == new_ip:
+        add_audit_event(session, "manual_apply_already_applied", target_id,
+                        {"hostname": target.hostname, "submitted_old_ip": old_ip,
+                         "authoritative_current_ip": authoritative_old_ip,
+                         "new_ip": new_ip, "benchmark_run_id": run_id})
         session.commit()
-        return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=candidate", status_code=303)
+        logger.info("manual_apply_success hostname=%s old_ip=%s new_ip=%s idempotent=True",
+                    target.hostname, authoritative_old_ip, new_ip)
+        return RedirectResponse(f"/targets/{target_id}?rewrite=already-applied&ip={new_ip}", status_code=303)
     logger.info("manual_apply_started hostname=%s old_ip=%s new_ip=%s run_id=%s",
-                target.hostname, old_ip, new_ip, run_id)
+                target.hostname, authoritative_old_ip, new_ip, run_id)
     try:
         outcome = set_rewrite(session, target, new_ip, "Manual Apply Best IP", run_id,
-                              expected_old_ip=old_ip)
+                              expected_old_ip=authoritative_old_ip)
     except AdGuardError as exc:
         logger.warning("manual_apply_failed hostname=%s old_ip=%s new_ip=%s reason=%s",
-                       target.hostname, old_ip, new_ip, type(exc).__name__)
+                       target.hostname, authoritative_old_ip, new_ip, type(exc).__name__)
         current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
         _persist_verified_current_ip(session, target_id, current_ip if lookup_succeeded else None)
+        if lookup_succeeded and current_ip == new_ip:
+            add_audit_event(session, "manual_apply_already_applied", target_id,
+                            {"hostname": target.hostname, "old_ip": authoritative_old_ip,
+                             "new_ip": new_ip, "benchmark_run_id": run_id,
+                             "reason": "concurrent_apply_reached_selected_ip"})
+            session.commit()
+            logger.info("manual_apply_success hostname=%s old_ip=%s new_ip=%s idempotent=True",
+                        target.hostname, authoritative_old_ip, new_ip)
+            return RedirectResponse(f"/targets/{target_id}?rewrite=already-applied&ip={new_ip}", status_code=303)
+        if ("changed since the benchmark" in str(exc)
+                and lookup_succeeded and current_ip != authoritative_old_ip):
+            add_audit_event(session, "manual_apply_conflict", target_id,
+                            {"hostname": target.hostname, "old_ip": authoritative_old_ip,
+                             "new_ip": new_ip, "verified_current_ip": current_ip,
+                             "reason": "external_rewrite_change"})
+            session.commit()
+            logger.warning("manual_apply_conflict hostname=%s old_ip=%s new_ip=%s actual_ip=%s",
+                           target.hostname, authoritative_old_ip, new_ip, current_ip)
+            return RedirectResponse(
+                f"/targets/{target_id}?rewrite=conflict&verified_ip={current_ip or ''}", status_code=303)
         add_audit_event(session, "manual_apply_failed", target_id,
-                        {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
+                        {"hostname": target.hostname, "old_ip": authoritative_old_ip, "new_ip": new_ip,
                          "verified_current_ip": current_ip if lookup_succeeded else None,
                          "reason": "adguard_write_failed", "error": type(exc).__name__})
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=adguard", status_code=303)
     except Exception as exc:
         logger.warning("manual_apply_failed hostname=%s old_ip=%s new_ip=%s reason=%s",
-                       target.hostname, old_ip, new_ip, type(exc).__name__)
+                       target.hostname, authoritative_old_ip, new_ip, type(exc).__name__)
         current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
         _persist_verified_current_ip(session, target_id, current_ip if lookup_succeeded else None)
         add_audit_event(session, "manual_apply_failed", target_id,
-                        {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
+                        {"hostname": target.hostname, "old_ip": authoritative_old_ip, "new_ip": new_ip,
                          "verified_current_ip": current_ip if lookup_succeeded else None,
                          "reason": "rewrite_or_persistence_failed", "error": type(exc).__name__})
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason=other", status_code=303)
     verified_current_ip = outcome.get("verified_current_ip")
     _persist_verified_current_ip(session, target_id, verified_current_ip)
+    if not outcome.get("changed") and verified_current_ip == new_ip:
+        add_audit_event(session, "manual_apply_already_applied", target_id,
+                        {"hostname": target.hostname, "old_ip": authoritative_old_ip,
+                         "new_ip": new_ip, "verified_current_ip": verified_current_ip,
+                         "benchmark_run_id": run_id, "reason": "concurrent_apply_reached_selected_ip"})
+        session.commit()
+        logger.info("manual_apply_success hostname=%s old_ip=%s new_ip=%s idempotent=True",
+                    target.hostname, authoritative_old_ip, new_ip)
+        return RedirectResponse(f"/targets/{target_id}?rewrite=already-applied&ip={new_ip}", status_code=303)
     if outcome.get("rolled_back"):
         return RedirectResponse(f"/targets/{target_id}?rewrite=rolled-back&verified_ip={verified_current_ip or ''}", status_code=303)
     if not outcome.get("healthy") or verified_current_ip != new_ip:
         reason = ("readback" if not outcome.get("readback_verified", verified_current_ip == new_ip)
                   or verified_current_ip != new_ip else "health")
         add_audit_event(session, "manual_apply_failed", target_id,
-                        {"hostname": target.hostname, "old_ip": old_ip, "new_ip": new_ip,
+                        {"hostname": target.hostname, "old_ip": authoritative_old_ip, "new_ip": new_ip,
                          "verified_current_ip": verified_current_ip, "reason": reason})
         session.commit()
         return RedirectResponse(f"/targets/{target_id}?rewrite=failed&reason={reason}", status_code=303)
-    return RedirectResponse(f"/targets/{target_id}?rewrite=applied&old_ip={old_ip}&new_ip={new_ip}", status_code=303)
+    return RedirectResponse(
+        f"/targets/{target_id}?rewrite=applied&old_ip={authoritative_old_ip}&new_ip={new_ip}", status_code=303)
 
 
 @router.post("/targets/{target_id}/add-to-dns", name="add_best_rewrite",
