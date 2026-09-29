@@ -57,6 +57,17 @@ def _restore_rewrite(client: AdGuardClient, hostname: str,
     return verified_ip == old_ip, verified_ip
 
 
+def _manual_apply_log(stage: str, hostname: str, old_ip: str | None,
+                      new_ip: str | None, **details) -> None:
+    """Emit compact, credential-free milestones for an operator initiated apply."""
+    if details:
+        logger.info("manual_apply_%s hostname=%s old_ip=%s new_ip=%s details=%s",
+                    stage, hostname, old_ip, new_ip, details)
+    else:
+        logger.info("manual_apply_%s hostname=%s old_ip=%s new_ip=%s",
+                    stage, hostname, old_ip, new_ip)
+
+
 def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                 reason: str, benchmark_run_id: int | None = None,
                 automatic: bool = False, expected_old_ip: str | None = None) -> dict:
@@ -79,9 +90,23 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                         {"old_ip": old_ip, "new_ip": new_ip, "reason": reason})
         session.commit()
         mutation_started = True
+        if reason == "Manual Apply Best IP":
+            _manual_apply_log("adguard_write", target.hostname, old_ip, new_ip,
+                              method="PUT", endpoint="/control/rewrite/update",
+                              target_domain=target.hostname, target_answer=old_ip,
+                              update_domain=target.hostname, update_answer=new_ip)
         _write(client, target.hostname, old_ip, new_ip)
         rewrite_verified = _rewrite_is(client, target.hostname, new_ip)
+        if reason == "Manual Apply Best IP":
+            readback = client.get_rewrite(target.hostname)
+            actual_ip = readback.get("answer") if readback else None
+            _manual_apply_log("readback", target.hostname, old_ip, new_ip,
+                              verified=rewrite_verified, actual_ip=actual_ip)
         healthy = rewrite_verified and (new_ip is None or _healthy(target, new_ip))
+        if reason == "Manual Apply Best IP":
+            _manual_apply_log("health", target.hostname, old_ip, new_ip,
+                              healthy=healthy if rewrite_verified else None,
+                              readback_verified=rewrite_verified)
         if healthy:
             add_rewrite_history(session, record.id, old_ip, new_ip, reason,
                                 benchmark_run_id, automatic=automatic)
@@ -94,31 +119,43 @@ def set_rewrite(session: Session, record: TargetRecord, new_ip: str | None,
                             {"old_ip": old_ip, "new_ip": new_ip, "reason": reason,
                              "automatic": automatic, "healthy": healthy})
             session.commit()
+            if reason == "Manual Apply Best IP":
+                _manual_apply_log("success", target.hostname, old_ip, new_ip)
             return {"changed": True, "old_ip": old_ip, "new_ip": new_ip,
                     "verified_current_ip": new_ip, "healthy": healthy}
 
         restored, verified_current_ip = _restore_rewrite(client, target.hostname, old_ip)
         mutation_started = False
-        add_rewrite_history(session, record.id, old_ip, new_ip,
-                            f"{reason}; immediate health check failed", benchmark_run_id,
-                            automatic=automatic)
-        add_rewrite_history(session, record.id, new_ip, old_ip,
-                            "Automatic rollback after failed post-change health check", benchmark_run_id,
-                            automatic=False)
+        if rewrite_verified and restored:
+            # History is a record of verified DNS transitions, never an unconfirmed write.
+            add_rewrite_history(session, record.id, new_ip, old_ip,
+                                "Rollback after failed post-change health check", benchmark_run_id,
+                                automatic=False)
         state = session.get(OptimizerStateRecord, record.id)
         if state is None:
             state = OptimizerStateRecord(target_id=record.id)
             session.add(state)
         state.current_rewrite_ip = verified_current_ip
-        add_audit_event(session, "rewrite_rollback", record.id,
-                        {"failed_ip": new_ip, "restored_ip": verified_current_ip, "health_check": "failed",
-                         "restored": restored})
+        event = "rewrite_rollback" if rewrite_verified and restored else "rewrite_apply_failed"
+        add_audit_event(session, event, record.id,
+                        {"old_ip": old_ip, "new_ip": new_ip, "verified_current_ip": verified_current_ip,
+                         "health_check": "failed" if rewrite_verified else "not_run",
+                         "readback_verified": rewrite_verified, "restored": restored})
         session.commit()
-        logger.warning("Rewrite rolled back host=%s failed_ip=%s", target.hostname, new_ip)
-        return {"changed": True, "rolled_back": restored, "old_ip": old_ip,
+        if reason == "Manual Apply Best IP":
+            _manual_apply_log("rollback" if rewrite_verified and restored else "failed",
+                              target.hostname, old_ip, new_ip,
+                              restored=restored, verified_current_ip=verified_current_ip)
+        logger.warning("Rewrite apply did not complete host=%s requested_ip=%s restored=%s",
+                       target.hostname, new_ip, restored)
+        return {"changed": rewrite_verified, "rolled_back": rewrite_verified and restored,
+                "readback_verified": rewrite_verified, "old_ip": old_ip,
                 "verified_current_ip": verified_current_ip,
                 "new_ip": new_ip, "healthy": False}
-    except Exception:
+    except Exception as exc:
+        if reason == "Manual Apply Best IP":
+            _manual_apply_log("failed", target.hostname, old_ip, new_ip,
+                              error=type(exc).__name__)
         try:
             session.rollback()
         except Exception as database_rollback_error:

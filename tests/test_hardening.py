@@ -140,7 +140,8 @@ def test_failed_post_change_health_immediately_rolls_back(tmp_path, monkeypatch)
         state = session.get(OptimizerStateRecord, target.id)
         assert state and state.current_rewrite_ip == "192.0.2.1"
         history = list(session.scalars(select(RewriteHistoryRecord).order_by(RewriteHistoryRecord.id)))
-        assert [item.new_ip for item in history] == ["192.0.2.2", "192.0.2.1"]
+        # Only the verified transition onto the candidate and its verified rollback belong in history.
+        assert [item.new_ip for item in history] == ["192.0.2.1"]
         assert session.scalar(select(AuditLogRecord.event).where(AuditLogRecord.event == "rewrite_rollback"))
     db.close()
 
@@ -178,6 +179,34 @@ def test_successful_rewrite_updates_existing_and_verifies_before_persisting(tmp_
         assert history and history.old_ip == "192.0.2.1" and history.new_ip == "192.0.2.2"
         assert session.scalar(select(AuditLogRecord.event).where(
             AuditLogRecord.target_id == target.id, AuditLogRecord.event == "rewrite_applied"))
+    db.close()
+
+
+def test_manual_apply_readback_mismatch_is_not_recorded_as_dns_transition(tmp_path, monkeypatch):
+    db = Database(f"sqlite:///{(tmp_path / 'rewrite-readback-mismatch.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    class MismatchAdGuard:
+        ip = "192.0.2.1"
+        def get_rewrite(self, _host): return {"answer": self.ip}
+        def update_rewrite(self, _old_host, _old_ip, _host, _new_ip): pass
+        def add_rewrite(self, *_args): pytest.fail("existing rewrite must use update")
+        def delete_rewrite(self, _host, _ip): self.ip = None
+        def close(self): pass
+
+    client = MismatchAdGuard()
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: client)
+    monkeypatch.setattr(rewrites, "_healthy", lambda *_args: pytest.fail("health must not run without readback"))
+    with db.session_factory() as session:
+        target = save_target(session, Target(hostname="mismatch.example"))
+        session.commit()
+        outcome = rewrites.set_rewrite(session, target, "192.0.2.2", "Manual Apply Best IP",
+                                       expected_old_ip="192.0.2.1")
+        assert outcome["readback_verified"] is False
+        assert outcome["verified_current_ip"] == "192.0.2.1"
+        assert session.scalar(select(RewriteHistoryRecord.id)) is None
+        assert session.scalar(select(AuditLogRecord.event).where(
+            AuditLogRecord.event == "rewrite_apply_failed"))
     db.close()
 
 

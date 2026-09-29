@@ -783,10 +783,11 @@ def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web,
     form = {"run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true"}
     assert client.post(f"/targets/{target_id}/apply-best", data={**form, "confirm": "false"}).status_code == 400
     response = client.post(f"/targets/{target_id}/apply-best", data=form, follow_redirects=False)
-    assert response.status_code == 303 and response.headers["location"].endswith("?rewrite=applied")
+    assert response.status_code == 303 and response.headers["location"].endswith(
+        "?rewrite=applied&old_ip=192.0.2.1&new_ip=192.0.2.2")
     assert calls == [("192.0.2.2", "Manual Apply Best IP", run_id, "192.0.2.1")]
     refreshed = client.get(response.headers["location"])
-    assert "Best IP applied and verified by AdGuard" in refreshed.text
+    assert "DNS rewrite updated: 192.0.2.1 -&gt; 192.0.2.2" in refreshed.text
     assert 'data-copy="192.0.2.2"' in refreshed.text
     with database.session() as session:
         from app.db.models import OptimizerStateRecord
@@ -796,10 +797,25 @@ def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web,
                         {"healthy": False, "rolled_back": True,
                          "verified_current_ip": "192.0.2.1"})
     failed = client.post(f"/targets/{target_id}/apply-best", data=form, follow_redirects=False)
-    assert failed.status_code == 303 and failed.headers["location"].endswith("?rewrite=rolled-back")
+    assert failed.status_code == 303 and failed.headers["location"].endswith(
+        "?rewrite=rolled-back&verified_ip=192.0.2.1")
     failed_page = client.get(failed.headers["location"])
-    assert "AdGuard verified the restored rewrite" in failed_page.text
+    assert "New IP failed health check; rolled back to 192.0.2.1" in failed_page.text
     assert 'data-copy="192.0.2.1"' in failed_page.text
+
+
+def test_apply_best_csrf_is_enforced(web):
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="apply-csrf.example"))
+        run = save_benchmark_run(session, target.id, [], {})
+        target_id, run_id = target.id, run.id
+    csrf = client.headers.pop("x-csrf-token")
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+    })
+    assert response.status_code == 403
+    client.headers["x-csrf-token"] = csrf
 
 
 def _seed_add_dns_target(database, hostname="add-dns.example", healthy=True):
@@ -1035,7 +1051,7 @@ def test_apply_uses_verified_readback_instead_of_requested_ip(web, monkeypatch):
         "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
     }, follow_redirects=False)
     page = client.get(response.headers["location"])
-    assert "Apply did not complete successfully" in page.text
+    assert "DNS rewrite update failed: AdGuard readback did not match the requested IP" in page.text
     assert 'data-copy="192.0.2.9"' in page.text
     current_row = page.text.split('<span>Current IP:</span>', 1)[1].split('</div>', 1)[0]
     assert 'data-copy="192.0.2.9"' in current_row
