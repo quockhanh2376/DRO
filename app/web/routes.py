@@ -418,9 +418,11 @@ def run_target_now(target_id: int, request: Request, session: Session = Depends(
 def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Form(...),
                        new_ip: str = Form(...), confirm: bool = Form(False),
                        session: Session = Depends(get_session)):
+    target = get_target_or_404(session, target_id)
+    logger.info("manual_apply_request_received target_id=%d hostname=%s selected_ip=%s",
+                target_id, target.hostname, new_ip)
     if not confirm:
         raise HTTPException(status_code=400, detail="Explicit rewrite confirmation is required")
-    target = get_target_or_404(session, target_id)
     logger.info("manual_apply_started hostname=%s old_ip=%s new_ip=%s run_id=%s",
                 target.hostname, old_ip, new_ip, run_id)
     run = get_benchmark_run(session, run_id)

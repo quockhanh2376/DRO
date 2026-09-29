@@ -751,6 +751,84 @@ def test_inline_and_standalone_share_apply_button_template(web):
     assert partial.count("Apply Best IP") == 1
 
 
+def test_apply_button_forms_are_native_post_forms_in_inline_and_detail_paths(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from html.parser import HTMLParser
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="form-owner.example"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="192.0.2.1", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=20, median_ms=20, min_ms=18, max_ms=22, jitter_ms=2),
+            BenchmarkResult(ip="192.0.2.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "192.0.2.1", "current_rewrite_lookup_succeeded": True},
+            DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip="192.0.2.2",
+                           reason="Candidate is faster"))
+        target_id, run_id = target.id, run.id
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    calls = []
+
+    def applied(session, target, new_ip, _reason, _run_id, **_kwargs):
+        from app.db.models import OptimizerStateRecord
+        calls.append((target.hostname, new_ip))
+        state = session.get(OptimizerStateRecord, target.id)
+        if state is None:
+            state = OptimizerStateRecord(target_id=target.id)
+            session.add(state)
+        state.current_rewrite_ip = new_ip
+        session.commit()
+        return {"healthy": True, "changed": True, "verified_current_ip": new_ip}
+
+    monkeypatch.setattr(web_routes, "set_rewrite", applied)
+
+    class FormOwnerParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.forms = []
+            self.apply_owner = None
+            self.apply_button_type = None
+            self.nested_apply = False
+            self.apply_controls = set()
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "form":
+                if self.forms and self.forms[-1].get("id") == f"apply-best-form-{target_id}":
+                    self.nested_apply = True
+                self.forms.append(attrs)
+                if attrs.get("id") == f"apply-best-form-{target_id}":
+                    self.apply_owner = attrs
+            elif tag == "input" and self.forms and self.forms[-1].get("id") == f"apply-best-form-{target_id}":
+                self.apply_controls.add(attrs.get("name"))
+            elif tag == "button" and self.forms and self.forms[-1].get("id") == f"apply-best-form-{target_id}":
+                self.apply_button_type = attrs.get("type")
+
+        def handle_endtag(self, tag):
+            if tag == "form" and self.forms:
+                self.forms.pop()
+
+    rendered_pages = (client.get("/targets"), client.get(f"/targets/{target_id}"))
+    for page in rendered_pages:
+        assert page.status_code == 200
+        parser = FormOwnerParser()
+        parser.feed(page.text)
+        assert parser.apply_owner is not None
+        assert parser.apply_owner.get("method", "get").lower() == "post"
+        assert parser.apply_owner.get("action") == f"/targets/{target_id}/apply-best"
+        assert parser.apply_owner.get("hx-boost") == "false"
+        assert {"csrf_token", "run_id", "old_ip", "new_ip", "confirm"} <= parser.apply_controls
+        assert parser.apply_button_type == "submit"
+        assert parser.nested_apply is False
+        response = client.post(parser.apply_owner["action"], data={
+            "csrf_token": client.headers["x-csrf-token"], "run_id": run_id,
+            "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+        }, follow_redirects=False)
+        assert response.status_code == 303
+    assert calls == [("form-owner.example", "192.0.2.2")] * 2
+
+
 def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web, monkeypatch):
     client, database = web
     import app.web.routes as web_routes

@@ -15,7 +15,7 @@
     <div class="benchmark-result-ip"><span>Current IP:</span><strong>{% if resolution_failed %}<span class="unavailable-value">Unavailable</span>{% else %}{% set ip_value = current_ip %}{% include "ip_copy.html" %}{% endif %}</strong></div>
     <div class="benchmark-result-ip"><span>Best IP:</span><strong class="best-ip">{% if resolution_failed %}<span class="unavailable-value">Unavailable</span>{% else %}{% set ip_value = best.ip if best else None %}{% include "ip_copy.html" %}{% endif %}</strong></div>
     <div class="benchmark-result-apply">{% if can_apply %}
-      <form method="post" action="/targets/{{ target.id }}/apply-best" class="apply-best-form" data-confirm="Apply best IP? This will change the AdGuard rewrite from {{ current_ip }} to {{ best.ip }}." onsubmit="return confirm(this.dataset.confirm)">
+      <form id="apply-best-form-{{ target.id }}" method="post" action="/targets/{{ target.id }}/apply-best" class="apply-best-form" hx-boost="false" data-confirm="Apply best IP? This will change the AdGuard rewrite from {{ current_ip }} to {{ best.ip }}." onsubmit="return confirm(this.dataset.confirm)">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="run_id" value="{{ latest.id }}">
         <input type="hidden" name="old_ip" value="{{ current_ip }}">
