@@ -157,23 +157,33 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
         ids = {"zulu.example": z_target.id, "myob.com": m_target.id,
                "accounts.intuit.com": a_target.id}
     page = client.get("/targets").text
-    blocks = re.findall(r'<tr id="target-block-(\d+)" class="target-primary-row" data-target-id="\d+" data-hostname="([^"]+)"', page)
+    blocks = re.findall(r'<tbody class="target-block" data-target-id="(\d+)" data-hostname="([^"]+)"', page)
     assert [hostname for _target_id, hostname in blocks] == [
         "accounts.intuit.com", "myob.com", "zulu.example"]
     assert [int(re.search(r'<td class="target-sequence">(\d+)</td>',
-                          page.split(f'id="target-block-{target_id}"', 1)[1].split("</tr>", 1)[0]).group(1))
+                          page.split(f'data-target-id="{target_id}"', 1)[1].split("</tbody>", 1)[0]).group(1))
             for target_id, _hostname in blocks] == [1, 2, 3]
     for hostname, target_id in ids.items():
         assert f'id="target-block-{target_id}"' in page
         assert f'data-hostname="{hostname}"' in page
-    assert 'id="target-search-input"' in page and 'type="search"' in page
-    assert 'id="target-search-clear"' in page and 'title="Clear search"' in page
-    assert 'id="target-search-message"' in page and 'role="status"' in page
+    card = page.split('class="panel"', 1)[1].split("</section>", 1)[0]
+    assert card.index('class="target-search"') < card.index('class="target-form"')
+    assert 'id="target-search-input"' in card and 'type="search"' in card
+    assert card.count('class="target-search-clear"') == 1
+    assert 'id="target-search-clear"' in card and 'title="Clear search"' in card
+    assert '>Search</button>' not in page
+    for target_id, _hostname in blocks:
+        tbody = page.split(f'data-target-id="{target_id}"', 1)[1].split("</tbody>", 1)[0]
+        assert f'id="target-block-{target_id}"' in tbody
+        assert f'id="ping-result-{target_id}"' in tbody
+        assert f'id="run-result-{target_id}"' in tbody
+        assert f'hx-target="#run-state-poll-{target_id}"' in tbody
     script = client.get("/static/targets.js").text
-    assert 'No matching domain found.' in script
-    assert 'matches found; showing first.' in script
-    assert 'scrollIntoView({ behavior: "smooth", block: "center" })' in script
+    assert 'searchInput.addEventListener("input"' in script
+    assert 'name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3' in script
+    assert 'collator.compare(a.dataset.hostname, b.dataset.hostname)' in script
     assert 'searchInput.focus()' in script and 'searchInput.value = ""' in script
+    assert 'table.append(block)' in script and 'target-sequence' in script
 
 
 def test_target_form_rejects_url_syntax_and_normalizes_hostname(web):

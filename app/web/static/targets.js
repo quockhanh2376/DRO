@@ -27,33 +27,42 @@ const searchForm = document.getElementById("target-search-form");
 if (searchForm) {
   const searchInput = document.getElementById("target-search-input");
   const clearButton = document.getElementById("target-search-clear");
-  const message = document.getElementById("target-search-message");
-  const targets = Array.from(document.querySelectorAll(".target-primary-row"));
-  searchForm.addEventListener("submit", (event) => {
-    event.preventDefault();
+  const table = document.querySelector(".table-wrap table");
+  const tbodyList = Array.from(table.querySelectorAll("tbody.target-block"));
+  const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+  const originalOrder = [...tbodyList].sort((a, b) => collator.compare(a.dataset.hostname, b.dataset.hostname));
+  let timer;
+  let previousFirst = null;
+  const updateOrder = () => {
     const query = searchInput.value.trim().toLocaleLowerCase();
-    message.textContent = "";
-    if (!query) {
-      searchInput.focus();
-      return;
+    const ranked = [...originalOrder].sort((a, b) => {
+      const left = a.dataset.hostname.trim().toLocaleLowerCase();
+      const right = b.dataset.hostname.trim().toLocaleLowerCase();
+      const rank = (name) => !query ? 0 : name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3;
+      return rank(left) - rank(right) || collator.compare(a.dataset.hostname, b.dataset.hostname);
+    });
+    ranked.forEach((block, index) => {
+      table.append(block);
+      block.querySelector(".target-sequence").textContent = String(index + 1);
+    });
+    const first = query ? ranked.find((block) => block.dataset.hostname.toLocaleLowerCase().includes(query)) : null;
+    if (previousFirst && previousFirst !== first) previousFirst.classList.remove("target-search-highlight");
+    if (first && first !== previousFirst) {
+      first.classList.remove("target-search-highlight");
+      void first.offsetWidth;
+      first.classList.add("target-search-highlight");
+      window.setTimeout(() => first.classList.remove("target-search-highlight"), 1500);
     }
-    const exact = targets.filter((row) => row.dataset.hostname.trim().toLocaleLowerCase() === query);
-    const matches = exact.length ? exact : targets.filter((row) => row.dataset.hostname.toLocaleLowerCase().includes(query));
-    if (!matches.length) {
-      message.textContent = "No matching domain found.";
-      return;
-    }
-    const row = matches[0];
-    row.scrollIntoView({ behavior: "smooth", block: "center" });
-    row.classList.remove("target-search-highlight");
-    void row.offsetWidth;
-    row.classList.add("target-search-highlight");
-    window.setTimeout(() => row.classList.remove("target-search-highlight"), 2200);
-    if (matches.length > 1) message.textContent = `${matches.length} matches found; showing first.`;
+    previousFirst = first;
+  };
+  searchInput.addEventListener("input", () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(updateOrder, 180);
   });
   clearButton.addEventListener("click", () => {
     searchInput.value = "";
-    message.textContent = "";
+    window.clearTimeout(timer);
+    updateOrder();
     searchInput.focus();
   });
 }
