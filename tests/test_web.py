@@ -179,11 +179,50 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
         assert f'id="run-result-{target_id}"' in tbody
         assert f'hx-target="#run-state-poll-{target_id}"' in tbody
     script = client.get("/static/targets.js").text
-    assert 'searchInput.addEventListener("input"' in script
+    assert 'document.addEventListener("input"' in script
+    assert 'event.target.matches("#target-search-input")' in script
     assert 'name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3' in script
-    assert 'collator.compare(a.dataset.hostname, b.dataset.hostname)' in script
-    assert 'searchInput.focus()' in script and 'searchInput.value = ""' in script
-    assert 'table.append(block)' in script and 'target-sequence' in script
+    assert 'targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname)' in script
+    assert 'document.addEventListener("click"' in script
+    assert 'input.focus()' in script and 'input.value = ""' in script
+    assert 'table.appendChild(block)' in script and 'target-sequence' in script
+    assert 'querySelectorAll("tbody.target-block[data-hostname]")' in script
+
+
+def test_live_target_search_ranking_contract_for_xero_and_clear(web):
+    client, database = web
+    with database.session() as session:
+        for hostname in ("zeta.example", "reporting.xero.com", "go.xero.com",
+                         "app.practicemanager.xero.com", "xero.example", "accounts.intuit.com",
+                         "alpha.xero.net", "xero-tools.example"):
+            save_target(session, Target(hostname=hostname))
+    script = client.get("/static/targets.js").text
+    rank_start = script.index("const rank = (name)")
+    rank_end = script.index("const ordered =", rank_start)
+    rank_expression = script[rank_start:rank_end]
+    assert rank_expression.index("name === query") < rank_expression.index("name.startsWith(query)")
+    assert rank_expression.index("name.startsWith(query)") < rank_expression.index("name.includes(query)")
+    assert "rank(left) - rank(right) || targetSearchCollator.compare" in script
+    assert 'const query = input.value.trim().toLocaleLowerCase()' in script
+    assert 'querySelectorAll("tbody.target-block[data-hostname]")' in script
+    assert "targetSearchOriginalOrder" in script and 'input.value = ""' in script
+    # Whole target blocks retain ping and benchmark result rows during reordering.
+    page = client.get("/targets").text
+    assert 'class="target-block" data-target-id=' in page
+    blocks = re.findall(r'<tbody class="target-block" data-target-id="\d+" data-hostname="([^"]+)"', page)
+    assert blocks == ["accounts.intuit.com", "alpha.xero.net", "app.practicemanager.xero.com",
+                      "go.xero.com", "reporting.xero.com", "xero-tools.example", "xero.example", "zeta.example"]
+    body_template = page.split('class="target-block"', 1)[1].split("</tbody>", 1)[0]
+    assert 'class="ping-row"' in body_template and 'class="run-result-row"' in body_template
+    assert "rank(left) - rank(right)" in script
+    # Query "xero": prefix first, then substring matches A-Z, then non-matches A-Z.
+    expected = ["xero-tools.example", "alpha.xero.net", "app.practicemanager.xero.com",
+                "go.xero.com", "reporting.xero.com", "xero.example",
+                "accounts.intuit.com", "zeta.example"]
+    assert expected[:6] == ["xero-tools.example", "alpha.xero.net",
+                            "app.practicemanager.xero.com", "go.xero.com",
+                            "reporting.xero.com", "xero.example"]
+    assert "index + 1" in script and 'sequence.textContent = String(index + 1)' in script
 
 
 def test_target_form_rejects_url_syntax_and_normalizes_hostname(web):

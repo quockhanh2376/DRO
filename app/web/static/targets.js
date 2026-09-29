@@ -23,49 +23,64 @@ document.addEventListener("click", async (event) => {
   }
 });
 
-const searchForm = document.getElementById("target-search-form");
-if (searchForm) {
-  const searchInput = document.getElementById("target-search-input");
-  const clearButton = document.getElementById("target-search-clear");
-  const table = document.querySelector(".table-wrap table");
-  const tbodyList = Array.from(table.querySelectorAll("tbody.target-block"));
-  const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
-  const originalOrder = [...tbodyList].sort((a, b) => collator.compare(a.dataset.hostname, b.dataset.hostname));
-  let timer;
-  let previousFirst = null;
-  const updateOrder = () => {
-    const query = searchInput.value.trim().toLocaleLowerCase();
-    const ranked = [...originalOrder].sort((a, b) => {
-      const left = a.dataset.hostname.trim().toLocaleLowerCase();
-      const right = b.dataset.hostname.trim().toLocaleLowerCase();
-      const rank = (name) => !query ? 0 : name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3;
-      return rank(left) - rank(right) || collator.compare(a.dataset.hostname, b.dataset.hostname);
-    });
-    ranked.forEach((block, index) => {
-      table.append(block);
-      block.querySelector(".target-sequence").textContent = String(index + 1);
-    });
-    const first = query ? ranked.find((block) => block.dataset.hostname.toLocaleLowerCase().includes(query)) : null;
-    if (previousFirst && previousFirst !== first) previousFirst.classList.remove("target-search-highlight");
-    if (first && first !== previousFirst) {
-      first.classList.remove("target-search-highlight");
-      void first.offsetWidth;
-      first.classList.add("target-search-highlight");
-      window.setTimeout(() => first.classList.remove("target-search-highlight"), 1500);
-    }
-    previousFirst = first;
-  };
-  searchInput.addEventListener("input", () => {
-    window.clearTimeout(timer);
-    timer = window.setTimeout(updateOrder, 180);
+let targetSearchTimer;
+let targetSearchOriginalOrder = null;
+let targetSearchPreviousFirst = null;
+const targetSearchCollator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+
+function reorderTargetBlocks(input) {
+  const table = input.closest(".panel")?.nextElementSibling?.querySelector("table")
+    || document.querySelector(".table-wrap table");
+  if (!table) return;
+  const blocks = Array.from(table.querySelectorAll("tbody.target-block[data-hostname]"));
+  if (!blocks.length) return;
+  if (!targetSearchOriginalOrder) {
+    targetSearchOriginalOrder = [...blocks].sort((a, b) =>
+      targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname));
+  }
+  const query = input.value.trim().toLocaleLowerCase();
+  const rank = (name) => !query ? 0 : name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3;
+  const ordered = [...targetSearchOriginalOrder].sort((a, b) => {
+    const left = a.dataset.hostname.trim().toLocaleLowerCase();
+    const right = b.dataset.hostname.trim().toLocaleLowerCase();
+    return rank(left) - rank(right) || targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname);
   });
-  clearButton.addEventListener("click", () => {
-    searchInput.value = "";
-    window.clearTimeout(timer);
-    updateOrder();
-    searchInput.focus();
+  ordered.forEach((block, index) => {
+    table.appendChild(block);
+    const sequence = block.querySelector(".target-sequence");
+    if (sequence) sequence.textContent = String(index + 1);
   });
+  const first = query ? ordered.find((block) => block.dataset.hostname.trim().toLocaleLowerCase().includes(query)) : null;
+  if (targetSearchPreviousFirst && targetSearchPreviousFirst !== first) {
+    targetSearchPreviousFirst.classList.remove("target-search-highlight");
+  }
+  if (first && first !== targetSearchPreviousFirst) {
+    first.classList.remove("target-search-highlight");
+    void first.offsetWidth;
+    first.classList.add("target-search-highlight");
+    window.setTimeout(() => first.classList.remove("target-search-highlight"), 1500);
+  }
+  targetSearchPreviousFirst = first;
 }
+
+// Delegation keeps search alive when HTMX updates descendants and avoids relying on
+// this deferred asset being evaluated after the Targets page body has been parsed.
+document.addEventListener("input", (event) => {
+  if (!event.target.matches("#target-search-input")) return;
+  window.clearTimeout(targetSearchTimer);
+  targetSearchTimer = window.setTimeout(() => reorderTargetBlocks(event.target), 180);
+});
+
+document.addEventListener("click", (event) => {
+  const clearButton = event.target.closest("#target-search-clear");
+  if (!clearButton) return;
+  const input = document.getElementById("target-search-input");
+  if (!input) return;
+  input.value = "";
+  window.clearTimeout(targetSearchTimer);
+  reorderTargetBlocks(input);
+  input.focus();
+});
 
 document.addEventListener("htmx:afterSwap", () => {
   document.querySelectorAll(".ping-console-output").forEach((output) => {
