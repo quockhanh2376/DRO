@@ -815,6 +815,76 @@ def test_apply_uses_live_adguard_rewrite_when_dro_cache_and_benchmark_are_stale(
         assert (history[0].old_ip, history[0].new_ip) == ("108.157.32.65", "108.157.32.2")
 
 
+def test_apply_navigation_keeps_dashboard_targets_and_detail_on_adguard_current_ip(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="app.myob.com"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="108.157.32.71", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "108.157.32.2", "current_rewrite_lookup_succeeded": True,
+            "resolution_failed": False},
+            DecisionResult(action="UPDATE", current_ip="108.157.32.2", candidate_ip="108.157.32.71",
+                           reason="Healthy best candidate"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="108.157.32.2"))
+        session.commit()
+
+    class FakeAdGuard:
+        current = "108.157.32.2"
+        writes = []
+        def get_rewrite(self, hostname): return {"domain": hostname, "answer": self.current}
+        def update_rewrite(self, old_domain, old_ip, domain, answer):
+            self.writes.append((old_domain, old_ip, domain, answer))
+            assert old_ip == self.current
+            self.current = answer
+        def add_rewrite(self, *_args): pytest.fail("existing rewrite must use update")
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (fake.current, True))
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    monkeypatch.setattr(rewrites, "_healthy", lambda _target, _ip: True)
+
+    initial_detail = client.get(f"/targets/{target_id}").text
+    initial_targets = client.get("/targets").text
+    target_block = initial_targets.split(f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    assert 'class="ip-copy-value">108.157.32.2' in initial_detail
+    assert 'class="ip-copy-value">108.157.32.2' in target_block
+    assert 'class="ip-copy-value">108.157.32.71' in target_block
+    assert f'action="/targets/{target_id}/apply-best"' in target_block
+
+    applied = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "108.157.32.2", "new_ip": "108.157.32.71", "confirm": "true",
+    }, follow_redirects=False)
+    assert applied.status_code == 303
+    detail = client.get(applied.headers["location"]).text
+    targets = client.get("/targets").text
+    dashboard = client.get("/").text
+    result_block = targets.split(f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    dashboard_row = re.search(rf'<tr><td><a href="/targets/{target_id}">app\.myob\.com</a>(.*?)</tr>',
+                              dashboard, re.S).group(1)
+
+    assert "DNS rewrite updated: 108.157.32.2 -&gt; 108.157.32.71" in detail
+    assert 'class="ip-copy-value">108.157.32.71' in detail
+    assert 'class="ip-copy-value">108.157.32.71' in result_block
+    assert 'class="ip-copy-value">108.157.32.71' in result_block
+    assert f'action="/targets/{target_id}/apply-best"' not in result_block
+    current_inline = result_block.split("Current IP:</span>", 1)[1].split("</strong>", 1)[0]
+    best_inline = result_block.split("Best IP:</span>", 1)[1].split("</strong>", 1)[0]
+    assert "108.157.32.71" in current_inline and "108.157.32.71" in best_inline
+    assert "108.157.32.71" in dashboard_row
+    assert "108.157.32.2" not in current_inline and "108.157.32.2" not in dashboard_row
+    assert fake.writes == [("app.myob.com", "108.157.32.2", "app.myob.com", "108.157.32.71")]
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == fake.current == "108.157.32.71"
+
+
 def test_true_external_rewrite_change_after_route_read_conflicts_and_syncs(web, monkeypatch):
     client, database = web
     import app.web.routes as web_routes

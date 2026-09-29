@@ -68,6 +68,21 @@ def _persist_verified_current_ip(session: Session, target_id: int, current_ip: s
     session.commit()
 
 
+def _sync_authoritative_current_ip(session: Session, target: TargetRecord) -> tuple[str | None, bool]:
+    """Read Current Rewrite from AdGuard and refresh DRO cache only after a successful read."""
+    current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
+    if not lookup_succeeded:
+        return None, False
+    state = session.get(OptimizerStateRecord, target.id)
+    if state is None:
+        state = OptimizerStateRecord(target_id=target.id)
+        session.add(state)
+    if state.current_rewrite_ip != current_ip:
+        state.current_rewrite_ip = current_ip
+        session.commit()
+    return current_ip, True
+
+
 def _dashboard_rows(session: Session) -> list[dict]:
     rows = []
     for target in list_targets(session):
@@ -80,15 +95,18 @@ def _dashboard_rows(session: Session) -> list[dict]:
                                        result.median_ms if result.median_ms is not None else float("inf"),
                                        result.jitter_ms if result.jitter_ms is not None else float("inf")),
                    default=None)
+        current_ip, current_lookup_succeeded = _sync_authoritative_current_ip(session, target)
         state = session.get(OptimizerStateRecord, target.id)
         schedule = session.get(ScheduleStateRecord, target.id)
-        current = next((item for item in results if state and item.ip == state.current_rewrite_ip), None)
+        current = next((item for item in results if current_lookup_succeeded
+                        and current_ip and item.ip == current_ip), None)
         improvement = None
         if current and best and current.average_ms and best.average_ms is not None:
             improvement = max(0.0, (current.average_ms - best.average_ms) / current.average_ms * 100)
         completed = run.completed_at if run else None
         next_run = next_run_time(completed, target.interval_hours) if completed else None
         rows.append({"target": target, "state": state, "run": run, "best": best,
+                     "current_ip": current_ip, "current_lookup_succeeded": current_lookup_succeeded,
                      "current": current, "improvement": improvement,
                      "wins": state.consecutive_wins if state else 0,
                      "last_run": schedule.last_run_at if schedule else completed,
@@ -106,14 +124,7 @@ def _add_to_dns_eligibility(session: Session, target: TargetRecord, run=None) ->
         run = latest
     latest = latest or run
     best = _best_benchmark_result(latest)
-    current_ip, lookup_succeeded = read_adguard_rewrite(target.hostname)
-    if lookup_succeeded:
-        state = session.get(OptimizerStateRecord, target.id)
-        if state is None:
-            state = OptimizerStateRecord(target_id=target.id)
-            session.add(state)
-        state.current_rewrite_ip = current_ip
-        session.commit()
+    current_ip, lookup_succeeded = _sync_authoritative_current_ip(session, target)
     result = {"latest": latest, "best": best, "can_add_to_dns": False,
               "current_ip": current_ip if lookup_succeeded else None,
               "current_rewrite_lookup_succeeded": lookup_succeeded}
