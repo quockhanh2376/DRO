@@ -25,7 +25,6 @@ document.addEventListener("click", async (event) => {
 
 let targetSearchTimer;
 let targetSearchOriginalOrder = null;
-let targetSearchPreviousFirst = null;
 const targetSearchCollator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 
 function reorderTargetBlocks(input) {
@@ -50,17 +49,18 @@ function reorderTargetBlocks(input) {
     const sequence = block.querySelector(".target-sequence");
     if (sequence) sequence.textContent = String(index + 1);
   });
-  const first = query ? ordered.find((block) => block.dataset.hostname.trim().toLocaleLowerCase().includes(query)) : null;
-  if (targetSearchPreviousFirst && targetSearchPreviousFirst !== first) {
-    targetSearchPreviousFirst.classList.remove("target-search-highlight");
-  }
-  if (first && first !== targetSearchPreviousFirst) {
-    first.classList.remove("target-search-highlight");
-    void first.offsetWidth;
-    first.classList.add("target-search-highlight");
-    window.setTimeout(() => first.classList.remove("target-search-highlight"), 1500);
-  }
-  targetSearchPreviousFirst = first;
+  blocks.forEach((block) => {
+    block.classList.remove("search-match", "search-best-match", "search-exact-match");
+  });
+  if (!query) return;
+  const matches = ordered.filter((block) => block.dataset.hostname.trim().toLocaleLowerCase().includes(query));
+  matches.forEach((block, index) => {
+    block.classList.add("search-match");
+    if (index === 0) block.classList.add("search-best-match");
+    if (block.dataset.hostname.trim().toLocaleLowerCase() === query) {
+      block.classList.add("search-exact-match");
+    }
+  });
 }
 
 // Delegation keeps search alive when HTMX updates descendants and avoids relying on

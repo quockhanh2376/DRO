@@ -187,6 +187,18 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
     assert 'input.focus()' in script and 'input.value = ""' in script
     assert 'table.appendChild(block)' in script and 'target-sequence' in script
     assert 'querySelectorAll("tbody.target-block[data-hostname]")' in script
+    assert 'blocks.forEach((block) => {' in script
+    assert 'block.classList.remove("search-match", "search-best-match", "search-exact-match")' in script
+    assert 'block.classList.add("search-match")' in script
+    assert 'block.classList.add("search-best-match")' in script
+    assert 'block.classList.add("search-exact-match")' in script
+    assert 'if (!query) return' in script
+    stylesheet = client.get("/static/style.css").text
+    assert ".target-block.search-match .benchmark-hostname" in stylesheet
+    assert ".target-block.search-best-match .benchmark-hostname" in stylesheet
+    assert ".target-block.search-exact-match .benchmark-hostname" in stylesheet
+    search_styles = stylesheet.split(".target-block.search-match", 1)[1]
+    assert "animation:" not in search_styles.split("@media", 1)[0]
 
 
 def test_live_target_search_ranking_contract_for_xero_and_clear(web):
@@ -223,6 +235,24 @@ def test_live_target_search_ranking_contract_for_xero_and_clear(web):
                             "app.practicemanager.xero.com", "go.xero.com",
                             "reporting.xero.com", "xero.example"]
     assert "index + 1" in script and 'sequence.textContent = String(index + 1)' in script
+
+
+def test_live_target_search_highlights_all_matches_and_clears_classes(web):
+    client, _database = web
+    script = client.get("/static/targets.js").text
+    apply_start = script.index('const matches = ordered.filter')
+    apply_end = script.index("// Delegation keeps search alive", apply_start)
+    feedback = script[apply_start:apply_end]
+    assert 'matches.forEach((block, index)' in feedback
+    assert 'block.classList.add("search-match")' in feedback
+    assert 'if (index === 0) block.classList.add("search-best-match")' in feedback
+    assert 'block.classList.add("search-exact-match")' in feedback
+    assert 'classList.remove("search-match", "search-best-match", "search-exact-match")' in script
+    css = client.get("/static/style.css").text
+    assert ".target-block.search-match .benchmark-hostname" in css
+    assert ".target-block.search-best-match .benchmark-hostname" in css
+    assert ".target-block.search-exact-match .benchmark-hostname" in css
+    assert "outline:2px solid #83d99a" in css
 
 
 def test_target_form_rejects_url_syntax_and_normalizes_hostname(web):
