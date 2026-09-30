@@ -131,6 +131,40 @@ def test_dashboard_and_targets_render(web):
     assert targets_page.index('id="run-result-1"') < targets_page.index("</table>")
 
 
+@pytest.mark.parametrize(("value", "text", "css_class"), [
+    (0.0, "0.0%", "improvement-low"),
+    (3.5, "3.5%", "improvement-low"),
+    ("6.0%", "6.0%", "improvement-medium"),
+    (9.9, "9.9%", "improvement-medium"),
+    (10.0, "10.0%", "improvement-high"),
+    (12.4, "12.4%", "improvement-high"),
+    (19.9, "19.9%", "improvement-high"),
+    (20.0, "20.0%", "improvement-very-high"),
+    (26.3, "26.3%", "improvement-very-high"),
+    (None, "—", "improvement-low"),
+    ("—", "—", "improvement-low"),
+    ("unavailable", "—", "improvement-low"),
+    ("not a percentage", "—", "improvement-low"),
+])
+def test_dashboard_improvement_display_classes(value, text, css_class):
+    from app.web.routes import _improvement_display
+
+    assert _improvement_display(value) == {"text": text, "css_class": css_class}
+
+
+def test_dashboard_improvement_classes_are_scoped_to_value_only():
+    from app.web.routes import templates
+
+    source = (Path(__file__).parents[1] / "app/web/templates/dashboard.html").read_text()
+    cell = re.search(r"<td><span class=\"\{\{ improvement\.css_class \}\}\">"
+                     r"\{\{ improvement\.text \}\}</span></td>", source)
+    stylesheet = (Path(__file__).parents[1] / "app/web/static/style.css").read_text()
+    assert cell
+    assert all(f".{name}" in stylesheet for name in (
+        "improvement-low", "improvement-medium", "improvement-high", "improvement-very-high"))
+    assert "improvement_display" in templates.env.globals
+
+
 def test_targets_form_is_compact_and_actions_are_play_edit_delete(web):
     client, database = web
     with database.session() as session:

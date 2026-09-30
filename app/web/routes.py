@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import ipaddress
+import math
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -41,6 +42,37 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["web"])
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 templates.env.filters["vn_time"] = format_vietnam_time
+
+
+def _improvement_display(value) -> dict[str, str]:
+    """Format a dashboard percentage and select its display-only emphasis class."""
+    try:
+        if value is None:
+            raise ValueError("unavailable")
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized.endswith("%"):
+                normalized = normalized[:-1].strip()
+            number = float(normalized)
+        else:
+            number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non-finite percentage")
+    except (TypeError, ValueError, OverflowError):
+        return {"text": "—", "css_class": "improvement-low"}
+
+    if number == 0 or number < 5:
+        css_class = "improvement-low"
+    elif number < 10:
+        css_class = "improvement-medium"
+    elif number < 20:
+        css_class = "improvement-high"
+    else:
+        css_class = "improvement-very-high"
+    return {"text": f"{number:.1f}%", "css_class": css_class}
+
+
+templates.env.globals["improvement_display"] = _improvement_display
 ADD_BEST_MAX_AGE = timedelta(hours=1)
 NO_CACHE_HEADERS = {
     "Cache-Control": "private, no-store, no-cache, max-age=0, must-revalidate",

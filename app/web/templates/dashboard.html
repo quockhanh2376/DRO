@@ -6,7 +6,7 @@
 <td>{% if row.current_lookup_succeeded %}{{ row.current_ip or "Unavailable" }}{% else %}<span class="unavailable-value">Unavailable</span><small class="current-ip-reason">AdGuard read failed</small>{% endif %}</td><td>{{ row.best.ip if row.best else "—" }}</td>
 <td>{{ "%.1f ms"|format(row.current.average_ms) if row.current and row.current.average_ms is not none else "—" }}</td>
 <td>{{ "%.1f ms"|format(row.best.average_ms) if row.best and row.best.average_ms is not none else "—" }}</td>
-<td>{{ "%.1f%%"|format(row.improvement) if row.improvement is not none else "—" }}</td>
+{% set improvement = improvement_display(row.improvement) %}<td><span class="{{ improvement.css_class }}">{{ improvement.text }}</span></td>
 <td>{{ row.wins }}/{{ row.target.required_consecutive_wins }}</td><td>{{ row.target.mode }}</td><td><span class="status">{{ row.status }}</span></td>
 <td>{{ row.last_run|vn_time }}</td>
 <td>{{ row.next_run|vn_time }}</td></tr>
