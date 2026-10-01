@@ -13,6 +13,19 @@
     </form>
   </div>
   {% if errors %}<div class="error" role="alert">{% for error in errors %}<p>{{ error }}</p>{% endfor %}</div>{% endif %}
+  <div class="dns-checker" aria-labelledby="dns-check-heading">
+    <h3 id="dns-check-heading">CHECK DNS</h3>
+    <form id="dns-check-form" method="post" action="/targets/dns-check" enctype="application/x-www-form-urlencoded" hx-boost="false">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}">
+      <label class="sr-only" for="dns-check-hostname">Domain or hostname</label>
+      <input class="dns-check-hostname" id="dns-check-hostname" name="hostname" type="text" autocomplete="off" placeholder="Domain / hostname" required>
+      <label class="sr-only" for="dns-check-record-type">DNS record type</label>
+      <select class="dns-check-type" id="dns-check-record-type" name="record_type" aria-label="DNS record type">
+        {% for record_type in ['A', 'AAAA', 'CNAME', 'MX', 'TXT'] %}<option value="{{ record_type }}"{% if record_type == 'A' %} selected{% endif %}>{{ record_type }}</option>{% endfor %}
+      </select>
+      <button class="button primary" type="submit">Check DNS</button>
+    </form>
+  </div>
   {% set f = form_values if form_values is defined and form_values else target %}
   <form method="post" action="{{ '/targets/' ~ target.id ~ '/edit' if target else '/targets' }}" class="target-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}">
@@ -31,6 +44,7 @@
     <p class="hint target-form-hint">HTTPS status codes 200–399 are accepted by the benchmark runner. Per-target accepted ranges and manual candidate lists are not configurable in this version.</p>
     <div class="target-form-footer"><button class="button primary" type="submit">{{ "Save target" if target else "Add target" }}</button>{% if target %} <a class="button secondary" href="/targets">Cancel</a>{% endif %}</div>
   </form>
+  <div id="dns-check-result" aria-live="polite"></div>
 </section>
 <script src="/static/targets.js" defer></script>
 <section class="table-wrap">

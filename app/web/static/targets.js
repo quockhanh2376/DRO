@@ -82,6 +82,34 @@ document.addEventListener("click", (event) => {
   input.focus();
 });
 
+document.addEventListener("submit", async (event) => {
+  const form = event.target.closest("#dns-check-form");
+  if (!form) return;
+  event.preventDefault();
+  const button = form.querySelector('button[type="submit"]');
+  const result = document.getElementById("dns-check-result");
+  if (!button || !result || button.disabled) return;
+  const originalText = "Check DNS";
+  button.disabled = true;
+  button.textContent = "Checking...";
+  try {
+    const response = await fetch(form.action, {
+      method: "POST",
+      body: new FormData(form),
+      credentials: "same-origin",
+      headers: { "X-Requested-With": "fetch" }
+    });
+    if (!response.ok) throw new Error("DNS check could not be completed. Please reload and try again.");
+    result.innerHTML = await response.text();
+  } catch (error) {
+    result.textContent = error instanceof Error ? error.message : "DNS check could not be completed.";
+    result.className = "dns-check-result dns-check-error";
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+});
+
 document.addEventListener("htmx:afterSwap", () => {
   document.querySelectorAll(".ping-console-output").forEach((output) => {
     output.scrollTop = output.scrollHeight;

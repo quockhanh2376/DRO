@@ -35,6 +35,7 @@ from app.core.rewrites import automatic_rewrite_enabled, set_rewrite, _healthy
 from app.integrations.adguard import AdGuardError, configured_adguard_client
 from app.db.repositories import add_rewrite_history
 from app.core.live_ping import PingLimitReached, PingSession, ping_sessions
+from app.core.dns_checker import DNSCheckInputError, check_dns
 from app.time_utils import format_vietnam_time, next_run_time
 from app.version import VERSION_DISPLAY
 
@@ -298,6 +299,21 @@ def targets_page(request: Request, session: Session = Depends(get_session)):
                                                     latest_runs=latest_runs, target=None,
                                                     errors=None,
                                                     default_interval_hours=default_interval_hours(session)))
+    response.headers.update(NO_CACHE_HEADERS)
+    return response
+
+
+@router.post("/targets/dns-check", response_class=HTMLResponse, name="dns_check_page",
+             dependencies=[Depends(protect_mutation)])
+def dns_check_page(request: Request, hostname: str = Form(""), record_type: str = Form("A")):
+    try:
+        result = check_dns(hostname, record_type)
+        error = None
+    except DNSCheckInputError as exc:
+        result, error = None, str(exc)
+    response = templates.TemplateResponse(request, "dns_check_result.html", {
+        "request": request, "result": result, "error": error,
+    })
     response.headers.update(NO_CACHE_HEADERS)
     return response
 

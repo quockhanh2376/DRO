@@ -131,6 +131,87 @@ def test_dashboard_and_targets_render(web):
     assert targets_page.index('id="run-result-1"') < targets_page.index("</table>")
 
 
+def test_dns_checker_ui_is_inside_add_target_card_and_separate_from_target_form(web):
+    client, _database = web
+    page = client.get("/targets").text
+    card = page.split('<section class="panel">', 1)[1].split('<section class="table-wrap">', 1)[0]
+    assert "CHECK DNS" in card
+    assert card.index('id="dns-check-form"') < card.index('class="target-form"')
+    assert card.index('class="target-form-footer"') < card.index('id="dns-check-result"')
+    assert 'name="hostname"' in card and 'id="dns-check-hostname"' in card
+    assert 'name="record_type"' in card
+    assert re.search(r'<option value="A" selected>A</option>', card)
+    assert all(f'<option value="{kind}"' in card for kind in ("AAAA", "CNAME", "MX", "TXT"))
+    assert card.count(">Check DNS</button>") == 1
+    assert 'id="hostname"' not in card
+    assert 'id="dns-check-result" aria-live="polite"' in card
+    script = client.get("/static/targets.js").text
+    assert 'event.target.closest("#dns-check-form")' in script
+    assert 'button.textContent = "Checking..."' in script
+    assert 'button.textContent = originalText' in script
+
+
+def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypatch):
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="dns-isolation.example"))
+        state = OptimizerStateRecord(target_id=target.id, current_rewrite_ip="192.0.2.44")
+        session.add(state)
+        session.commit()
+        target_id = target.id
+    fake_result = {
+        "hostname": "example.com", "record_type": "A", "rows": [
+            {"name": "Google", "region": "Global", "answers": ["192.0.2.4"],
+             "response_ms": 18.2, "status": "OK", "status_class": "ok"},
+            {"name": "Cloudflare", "region": "Global", "answers": ["192.0.2.4"],
+             "response_ms": 21.0, "status": "OK", "status_class": "ok"},
+        ], "unique_answers": ["192.0.2.4"], "unique_count": 1,
+        "resolver_count": 2, "successful_count": 2, "failed_count": 0, "overall_class": "ok",
+    }
+    calls = []
+    monkeypatch.setattr(web_routes, "check_dns", lambda hostname, kind: calls.append((hostname, kind)) or fake_result)
+    monkeypatch.setattr(web_routes, "configured_adguard_client",
+                        lambda: (_ for _ in ()).throw(AssertionError("AdGuard must not be called")))
+    response = client.post("/targets/dns-check", data={
+        "csrf_token": client.headers["x-csrf-token"], "hostname": "Example.com", "record_type": "A",
+    })
+    assert response.status_code == 200
+    assert "DNS Check Result: example.com" in response.text
+    assert "Google" in response.text and "Cloudflare" in response.text
+    assert "Unique answers: <strong>1</strong>" in response.text
+    assert calls == [("Example.com", "A")]
+    with database.session() as session:
+        assert session.scalar(select(TargetRecord).where(TargetRecord.id == target_id)).hostname == "dns-isolation.example"
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.44"
+        assert session.query(RewriteHistoryRecord).count() == 0
+        assert session.query(AuditLogRecord).count() == 0
+
+
+def test_dns_check_rejects_invalid_hostname_and_enforces_auth_and_csrf(web, monkeypatch):
+    import app.web.routes as web_routes
+
+    client, _database = web
+    from app.core.dns_checker import DNSCheckInputError
+    monkeypatch.setattr(web_routes, "check_dns", lambda *_args: (_ for _ in ()).throw(
+        DNSCheckInputError("Enter a valid hostname.")))
+    response = client.post("/targets/dns-check", data={
+        "csrf_token": client.headers["x-csrf-token"], "hostname": "https://example.com", "record_type": "A",
+    })
+    assert response.status_code == 200 and "Enter a valid hostname." in response.text
+    rejected_csrf = client.post("/targets/dns-check", data={
+        "csrf_token": "wrong", "hostname": "example.com", "record_type": "A",
+    }, headers={"x-csrf-token": "wrong"})
+    assert rejected_csrf.status_code == 403
+    client.cookies.clear()
+    unauthenticated = client.post("/targets/dns-check", data={
+        "csrf_token": "unused", "hostname": "example.com", "record_type": "A",
+    }, follow_redirects=False)
+    assert unauthenticated.status_code == 303 and unauthenticated.headers["location"] == "/login"
+
+
 @pytest.mark.parametrize(("value", "text", "css_class"), [
     (0.0, "0.0%", "improvement-low"),
     (3.5, "3.5%", "improvement-low"),
