@@ -26,6 +26,7 @@
       <button class="button primary" type="submit">Check DNS</button>
     </form>
   </div>
+  <div id="dns-check-result" aria-live="polite"></div>
   {% set f = form_values if form_values is defined and form_values else target %}
   <form method="post" action="{{ '/targets/' ~ target.id ~ '/edit' if target else '/targets' }}" class="target-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token|default('') }}">
@@ -44,7 +45,6 @@
     <p class="hint target-form-hint">HTTPS status codes 200–399 are accepted by the benchmark runner. Per-target accepted ranges and manual candidate lists are not configurable in this version.</p>
     <div class="target-form-footer"><button class="button primary" type="submit">{{ "Save target" if target else "Add target" }}</button>{% if target %} <a class="button secondary" href="/targets">Cancel</a>{% endif %}</div>
   </form>
-  <div id="dns-check-result" aria-live="polite"></div>
 </section>
 <script src="/static/targets.js" defer></script>
 <section class="table-wrap">

@@ -136,8 +136,9 @@ def test_dns_checker_ui_is_inside_add_target_card_and_separate_from_target_form(
     page = client.get("/targets").text
     card = page.split('<section class="panel">', 1)[1].split('<section class="table-wrap">', 1)[0]
     assert "CHECK DNS" in card
-    assert card.index('id="dns-check-form"') < card.index('class="target-form"')
-    assert card.index('class="target-form-footer"') < card.index('id="dns-check-result"')
+    assert card.index('id="dns-check-form"') < card.index('id="dns-check-result"')
+    assert card.index('id="dns-check-result"') < card.index('class="target-form"')
+    assert ".dns-check-result" not in card
     assert 'name="hostname"' in card and 'id="dns-check-hostname"' in card
     assert 'name="record_type"' in card
     assert re.search(r'<option value="A" selected>A</option>', card)
@@ -149,6 +150,7 @@ def test_dns_checker_ui_is_inside_add_target_card_and_separate_from_target_form(
     assert 'event.target.closest("#dns-check-form")' in script
     assert 'button.textContent = "Checking..."' in script
     assert 'button.textContent = originalText' in script
+    assert 'result.innerHTML = await response.text()' in script
 
 
 def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypatch):
