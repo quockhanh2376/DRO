@@ -23,8 +23,7 @@ document.addEventListener("click", async (event) => {
   }
 });
 
-let targetSearchTimer;
-let targetSearchOriginalOrder = null;
+(() => {
 const targetSearchCollator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 
 function reorderTargetBlocks(input) {
@@ -33,13 +32,11 @@ function reorderTargetBlocks(input) {
   if (!table) return;
   const blocks = Array.from(table.querySelectorAll("tbody.target-block[data-hostname]"));
   if (!blocks.length) return;
-  if (!targetSearchOriginalOrder) {
-    targetSearchOriginalOrder = [...blocks].sort((a, b) =>
-      targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname));
-  }
+  const originalOrder = [...blocks].sort((a, b) =>
+    targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname));
   const query = input.value.trim().toLocaleLowerCase();
   const rank = (name) => !query ? 0 : name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3;
-  const ordered = [...targetSearchOriginalOrder].sort((a, b) => {
+  const ordered = originalOrder.sort((a, b) => {
     const left = a.dataset.hostname.trim().toLocaleLowerCase();
     const right = b.dataset.hostname.trim().toLocaleLowerCase();
     return rank(left) - rank(right) || targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname);
@@ -63,24 +60,33 @@ function reorderTargetBlocks(input) {
   });
 }
 
-// Delegation keeps search alive when HTMX updates descendants and avoids relying on
-// this deferred asset being evaluated after the Targets page body has been parsed.
-document.addEventListener("input", (event) => {
-  if (!event.target.matches("#target-search-input")) return;
-  window.clearTimeout(targetSearchTimer);
-  targetSearchTimer = window.setTimeout(() => reorderTargetBlocks(event.target), 180);
-});
+// Install delegated search handlers once; every keystroke reorders only existing DOM blocks.
+if (!window.droTargetSearchHandlersInstalled) {
+  window.droTargetSearchHandlersInstalled = true;
+  document.addEventListener("input", (event) => {
+    if (!event.target.matches("#target-search-input")) return;
+    reorderTargetBlocks(event.target);
+  });
 
-document.addEventListener("click", (event) => {
-  const clearButton = event.target.closest("#target-search-clear");
-  if (!clearButton) return;
-  const input = document.getElementById("target-search-input");
-  if (!input) return;
-  input.value = "";
-  window.clearTimeout(targetSearchTimer);
-  reorderTargetBlocks(input);
-  input.focus();
-});
+  document.addEventListener("click", (event) => {
+    const clearButton = event.target.closest("#target-search-clear");
+    if (!clearButton) return;
+    const input = document.getElementById("target-search-input");
+    if (!input) return;
+    input.value = "";
+    reorderTargetBlocks(input);
+    input.focus();
+  });
+
+  document.addEventListener("htmx:afterSwap", (event) => {
+    const target = event.detail?.target;
+    if (!target || !(target.matches("table, tbody.target-block")
+        || target.querySelector("table tbody.target-block, tbody.target-block"))) return;
+    const input = document.getElementById("target-search-input");
+    if (input) reorderTargetBlocks(input);
+  });
+}
+})();
 
 document.addEventListener("submit", async (event) => {
   const form = event.target.closest("#dns-check-form");

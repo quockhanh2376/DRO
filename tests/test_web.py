@@ -303,6 +303,9 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
     card = page.split('class="panel"', 1)[1].split("</section>", 1)[0]
     assert card.index('class="target-search"') < card.index('class="target-form"')
     assert 'id="target-search-input"' in card and 'type="search"' in card
+    assert '<div class="target-search"' in card and '<form class="target-search"' not in card
+    assert 'onsubmit="return false"' not in card
+    assert '<form id="dns-check-form"' in card and '<form method="post" action="/targets"' in card
     assert card.count('class="target-search-clear"') == 1
     assert 'id="target-search-clear"' in card and 'title="Clear search"' in card
     search_field = card.split('class="target-search-field"', 1)[1].split("</div>", 1)[0]
@@ -318,6 +321,11 @@ def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
     script = client.get("/static/targets.js").text
     assert 'document.addEventListener("input"' in script
     assert 'event.target.matches("#target-search-input")' in script
+    input_handler = script.split('document.addEventListener("input"', 1)[1].split('document.addEventListener("click"', 1)[0]
+    assert "reorderTargetBlocks(event.target)" in input_handler
+    assert "setTimeout" not in input_handler and "fetch(" not in input_handler
+    assert "preventDefault" not in input_handler and "htmx" not in input_handler.lower()
+    assert "window.droTargetSearchHandlersInstalled" in script
     assert 'document.addEventListener("click"' in script
     assert 'input.value = ""' in script and 'input.focus()' in script
     assert "reorderTargetBlocks(event.target)" in script and "reorderTargetBlocks(input)" in script
@@ -363,7 +371,9 @@ def test_live_target_search_ranking_contract_for_xero_and_clear(web):
     assert "rank(left) - rank(right) || targetSearchCollator.compare" in script
     assert 'const query = input.value.trim().toLocaleLowerCase()' in script
     assert 'querySelectorAll("tbody.target-block[data-hostname]")' in script
-    assert "targetSearchOriginalOrder" in script and 'input.value = ""' in script
+    assert "const originalOrder = [...blocks].sort" in script and 'input.value = ""' in script
+    assert 'document.addEventListener("htmx:afterSwap"' in script
+    assert "if (input) reorderTargetBlocks(input)" in script
     # Whole target blocks retain ping and benchmark result rows during reordering.
     page = client.get("/targets").text
     assert 'class="target-block" data-target-id=' in page
@@ -383,11 +393,37 @@ def test_live_target_search_ranking_contract_for_xero_and_clear(web):
     assert "index + 1" in script and 'sequence.textContent = String(index + 1)' in script
 
 
+def test_target_search_updates_every_input_and_clear_without_form_or_request(web):
+    client, _database = web
+    page = client.get("/targets").text
+    script = client.get("/static/targets.js").text
+    search = script.split("// Install delegated search handlers once", 1)[1].split("})();", 1)[0]
+    input_handler = search.split('document.addEventListener("input"', 1)[1].split(
+        'document.addEventListener("click"', 1)[0]
+    assert "reorderTargetBlocks(event.target)" in input_handler
+    assert "setTimeout" not in input_handler and "fetch(" not in input_handler
+    assert "preventDefault" not in input_handler and "htmx" not in input_handler.lower()
+    # The native input event fires on character entry, deletion, and backspace.
+    assert 'event.target.matches("#target-search-input")' in input_handler
+    clear_handler = search.split('document.addEventListener("click"', 1)[1].split(
+        'document.addEventListener("htmx:afterSwap"', 1)[0]
+    assert 'input.value = ""' in clear_handler
+    assert "reorderTargetBlocks(input)" in clear_handler and "input.focus()" in clear_handler
+    assert "window.droTargetSearchHandlersInstalled" in script
+    assert 'id="target-search" role="search"' in page
+    assert '<form class="target-search"' not in page
+    assert '<form id="dns-check-form"' in page
+    assert 'class="target-form"' in page
+    htmx_handler = search.split('document.addEventListener("htmx:afterSwap"', 1)[1]
+    assert "reorderTargetBlocks(input)" in htmx_handler
+    assert "const originalOrder = [...blocks].sort" in script
+
+
 def test_live_target_search_highlights_all_matches_and_clears_classes(web):
     client, _database = web
     script = client.get("/static/targets.js").text
     apply_start = script.index('const matches = ordered.filter')
-    apply_end = script.index("// Delegation keeps search alive", apply_start)
+    apply_end = script.index("})();", apply_start)
     feedback = script[apply_start:apply_end]
     assert 'matches.forEach((block, index)' in feedback
     assert 'block.classList.add("search-match")' in feedback
