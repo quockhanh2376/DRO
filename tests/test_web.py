@@ -168,6 +168,7 @@ def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypa
     rows = [{"name": profile.name, "region": profile.region, "answers": ["192.0.2.4"],
              "response_ms": 10.0 + index, "status": "OK", "status_class": "ok",
              "fastest": index == 2} for index, profile in enumerate(RESOLVER_PROFILES)]
+    rows[0]["answers"] = ["108.157.32.65", "108.157.32.71", "108.157.32.2", "108.157.32.25"]
     fake_result = {"hostname": "example.com", "record_type": "A", "rows": rows,
                    "unique_answers": ["192.0.2.4"], "unique_count": 1,
                    "resolver_count": len(rows), "successful_count": len(rows),
@@ -186,6 +187,15 @@ def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypa
     for region in ("Vietnam", "Singapore", "Malaysia", "Hong Kong", "Australia", "Japan"):
         assert f">{region}</td>" in response.text
     assert response.text.count('class="dns-fastest-badge"') == 1
+    assert 'class="dns-answer-list dns-answer-ip-grid"' in response.text
+    for answer in rows[0]["answers"]:
+        assert f'class="dns-answer-value">{answer}</code>' in response.text
+    assert "dns-check-fastest" in response.text
+    css = client.get("/static/style.css").text
+    assert ".dns-check-table .dns-col-answer{width:43%}" in css
+    assert ".dns-check-result code.dns-answer-value" in css
+    assert "text-overflow:ellipsis" not in css.split(".dns-answer-list", 1)[1].split("}", 1)[0]
+    assert "grid-template-columns:minmax(0,1fr)" in css.split("@media(max-width:700px)", 1)[1]
     assert "Unique answers: <strong>1</strong>" in response.text
     assert calls == [("Example.com", "A")]
     with database.session() as session:
@@ -193,6 +203,33 @@ def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypa
         assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.44"
         assert session.query(RewriteHistoryRecord).count() == 0
         assert session.query(AuditLogRecord).count() == 0
+
+
+@pytest.mark.parametrize("record_type", ["TXT", "CNAME"])
+def test_dns_check_long_text_answers_use_wrapping_single_column(web, monkeypatch, record_type):
+    import app.web.routes as web_routes
+    from app.core.dns_checker import RESOLVER_PROFILES
+
+    client, _database = web
+    long_value = ("verification-token-" * 14) if record_type == "TXT" else "very-long-cdn-alias." * 8 + "example.net"
+    rows = [{"name": profile.name, "region": profile.region, "answers": [long_value, long_value + "-second"],
+             "response_ms": 10.0 + index, "status": "OK", "status_class": "ok",
+             "fastest": index == 0} for index, profile in enumerate(RESOLVER_PROFILES)]
+    fake_result = {"hostname": "example.com", "record_type": record_type, "rows": rows,
+                   "unique_answers": [], "unique_count": 0, "resolver_count": len(rows),
+                   "successful_count": len(rows), "failed_count": 0, "overall_class": "ok"}
+    monkeypatch.setattr(web_routes, "check_dns", lambda *_args: fake_result)
+    response = client.post("/targets/dns-check", data={
+        "csrf_token": client.headers["x-csrf-token"], "hostname": "example.com", "record_type": record_type,
+    })
+    assert response.status_code == 200
+    assert 'class="dns-answer-list dns-answer-text-list"' in response.text
+    assert f'class="dns-answer-value">{long_value}</code>' in response.text
+    assert f'class="dns-answer-value">{long_value}-second</code>' in response.text
+    assert 'class="dns-answer-list dns-answer-ip-grid"' not in response.text
+    css = client.get("/static/style.css").text
+    assert ".dns-check-result code.dns-answer-value" in css
+    assert "overflow-wrap:anywhere" in css
 
 
 def test_dns_check_rejects_invalid_hostname_and_enforces_auth_and_csrf(web, monkeypatch):
