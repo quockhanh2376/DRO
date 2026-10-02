@@ -188,12 +188,17 @@ def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypa
         assert f">{region}</td>" in response.text
     assert response.text.count('class="dns-fastest-badge"') == 1
     assert 'class="dns-answer-list dns-answer-ip-grid"' in response.text
+    assert 'class="dns-ip-badge dns-ip-badge-unique"' in response.text
+    assert 'class="dns-answer-value dns-ip-badge dns-ip-badge-answer">108.157.32.65</code>' in response.text
     for answer in rows[0]["answers"]:
-        assert f'class="dns-answer-value">{answer}</code>' in response.text
+        assert f'>{answer}</code>' in response.text
     assert "dns-check-fastest" in response.text
     css = client.get("/static/style.css").text
     assert ".dns-check-table .dns-col-answer{width:43%}" in css
     assert ".dns-check-result code.dns-answer-value" in css
+    assert ".dns-check-result code.dns-ip-badge{color:#7CFF9B;background:#050807" in css
+    assert ".dns-check-result code.dns-ip-badge-unique{font-size:14px}" in css
+    assert ".dns-check-result code.dns-ip-badge-answer{font-size:16px}" in css
     assert "text-overflow:ellipsis" not in css.split(".dns-answer-list", 1)[1].split("}", 1)[0]
     assert "grid-template-columns:minmax(0,1fr)" in css.split("@media(max-width:700px)", 1)[1]
     assert "Unique answers: <strong>1</strong>" in response.text
@@ -226,6 +231,7 @@ def test_dns_check_long_text_answers_use_wrapping_single_column(web, monkeypatch
     assert 'class="dns-answer-list dns-answer-text-list"' in response.text
     assert f'class="dns-answer-value">{long_value}</code>' in response.text
     assert f'class="dns-answer-value">{long_value}-second</code>' in response.text
+    assert "dns-ip-badge" not in response.text
     assert 'class="dns-answer-list dns-answer-ip-grid"' not in response.text
     css = client.get("/static/style.css").text
     assert ".dns-check-result code.dns-answer-value" in css
