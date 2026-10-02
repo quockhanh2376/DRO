@@ -155,6 +155,7 @@ def test_dns_checker_ui_is_inside_add_target_card_and_separate_from_target_form(
 
 def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypatch):
     import app.web.routes as web_routes
+    from app.core.dns_checker import RESOLVER_PROFILES
     from app.db.models import OptimizerStateRecord
 
     client, database = web
@@ -164,15 +165,13 @@ def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypa
         session.add(state)
         session.commit()
         target_id = target.id
-    fake_result = {
-        "hostname": "example.com", "record_type": "A", "rows": [
-            {"name": "Google", "region": "Global", "answers": ["192.0.2.4"],
-             "response_ms": 18.2, "status": "OK", "status_class": "ok"},
-            {"name": "Cloudflare", "region": "Global", "answers": ["192.0.2.4"],
-             "response_ms": 21.0, "status": "OK", "status_class": "ok"},
-        ], "unique_answers": ["192.0.2.4"], "unique_count": 1,
-        "resolver_count": 2, "successful_count": 2, "failed_count": 0, "overall_class": "ok",
-    }
+    rows = [{"name": profile.name, "region": profile.region, "answers": ["192.0.2.4"],
+             "response_ms": 10.0 + index, "status": "OK", "status_class": "ok",
+             "fastest": index == 2} for index, profile in enumerate(RESOLVER_PROFILES)]
+    fake_result = {"hostname": "example.com", "record_type": "A", "rows": rows,
+                   "unique_answers": ["192.0.2.4"], "unique_count": 1,
+                   "resolver_count": len(rows), "successful_count": len(rows),
+                   "failed_count": 0, "overall_class": "ok"}
     calls = []
     monkeypatch.setattr(web_routes, "check_dns", lambda hostname, kind: calls.append((hostname, kind)) or fake_result)
     monkeypatch.setattr(web_routes, "configured_adguard_client",
@@ -183,6 +182,10 @@ def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypa
     assert response.status_code == 200
     assert "DNS Check Result: example.com" in response.text
     assert "Google" in response.text and "Cloudflare" in response.text
+    assert "Country / Region" in response.text and "Fastest" in response.text
+    for region in ("Vietnam", "Singapore", "Malaysia", "Hong Kong", "Australia", "Japan"):
+        assert f">{region}</td>" in response.text
+    assert response.text.count('class="dns-fastest-badge"') == 1
     assert "Unique answers: <strong>1</strong>" in response.text
     assert calls == [("Example.com", "A")]
     with database.session() as session:

@@ -7,15 +7,30 @@ import secrets
 import socket
 import struct
 import time
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 
-RESOLVERS = (
-    {"name": "Google", "region": "Global", "ip": "8.8.8.8"},
-    {"name": "Cloudflare", "region": "Global", "ip": "1.1.1.1"},
-    {"name": "Quad9", "region": "Global", "ip": "9.9.9.9"},
-    {"name": "OpenDNS", "region": "Global", "ip": "208.67.222.222"},
+@dataclass(frozen=True, slots=True)
+class ResolverProfile:
+    name: str
+    region: str
+    endpoint: str
+    protocol: str = "UDP DNS"
+
+
+RESOLVER_PROFILES = (
+    ResolverProfile("Google", "Global / Anycast", "8.8.8.8:53"),
+    ResolverProfile("Cloudflare", "Global / Anycast", "1.1.1.1:53"),
+    ResolverProfile("Quad9", "Global / Anycast", "9.9.9.9:53"),
+    ResolverProfile("OpenDNS", "Global / Anycast", "208.67.222.222:53"),
+    ResolverProfile("VN Resolver", "Vietnam", "42.116.255.180:53"),
+    ResolverProfile("SG Resolver", "Singapore", "129.126.119.238:53"),
+    ResolverProfile("MY Resolver", "Malaysia", "1.9.63.98:53"),
+    ResolverProfile("HK Resolver", "Hong Kong", "218.255.10.58:53"),
+    ResolverProfile("AU Resolver", "Australia", "203.54.212.126:53"),
+    ResolverProfile("JP Resolver", "Japan", "219.163.11.226:53"),
 )
 RECORD_TYPES = {"A": 1, "AAAA": 28, "CNAME": 5, "MX": 15, "TXT": 16}
 RESOLVER_TIMEOUT_SECONDS = 3.0
@@ -155,14 +170,15 @@ def _parse_answers(packet: bytes, expected_id: int, record_type: str) -> tuple[i
 _RCODE_STATUS = {0: "OK", 1: "Format error", 2: "Server failure", 3: "No records", 4: "Not supported", 5: "Refused"}
 
 
-def _query_resolver(hostname: str, record_type: str, resolver: dict[str, str]) -> dict[str, Any]:
+def _query_resolver(hostname: str, record_type: str, resolver: ResolverProfile) -> dict[str, Any]:
     query_id = secrets.randbits(16)
     query = _encode_query(hostname, record_type, query_id)
     started = time.perf_counter()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(RESOLVER_TIMEOUT_SECONDS)
-            sock.connect((resolver["ip"], 53))
+            endpoint, port = resolver.endpoint.rsplit(":", 1)
+            sock.connect((endpoint, int(port)))
             sock.send(query)
             response = sock.recv(4096)
         rcode, answers = _parse_answers(response, query_id, record_type)
@@ -174,7 +190,7 @@ def _query_resolver(hostname: str, record_type: str, resolver: dict[str, str]) -
     except (OSError, ValueError, struct.error) as exc:
         answers, status = [], "Network error" if isinstance(exc, OSError) else "Invalid DNS response"
     elapsed = (time.perf_counter() - started) * 1000
-    return {"name": resolver["name"], "region": resolver["region"], "answers": answers,
+    return {"name": resolver.name, "region": resolver.region, "answers": answers,
             "response_ms": round(elapsed, 1), "status": status,
             "status_class": "ok" if status == "OK" else "error" if status in {"Timeout", "Network error", "Invalid DNS response"} else "warning"}
 
@@ -184,9 +200,14 @@ def check_dns(value: str, record_type: str = "A") -> dict[str, Any]:
     normalized_type = record_type.strip().upper() if isinstance(record_type, str) else ""
     if normalized_type not in RECORD_TYPES:
         raise DNSCheckInputError("Choose a supported record type.")
-    with ThreadPoolExecutor(max_workers=min(MAX_RESOLVER_CONCURRENCY, len(RESOLVERS))) as pool:
-        rows = list(pool.map(lambda resolver: _query_resolver(hostname, normalized_type, resolver), RESOLVERS))
+    with ThreadPoolExecutor(max_workers=min(MAX_RESOLVER_CONCURRENCY, len(RESOLVER_PROFILES))) as pool:
+        rows = list(pool.map(
+            lambda resolver: _query_resolver(hostname, normalized_type, resolver), RESOLVER_PROFILES))
     unique_answers = sorted({answer for row in rows for answer in row["answers"]}, key=str.casefold)
+    fastest = min((row for row in rows if row["status"] == "OK"),
+                  key=lambda row: row["response_ms"], default=None)
+    for row in rows:
+        row["fastest"] = row is fastest
     successful = sum(row["status"] == "OK" for row in rows)
     return {"hostname": hostname, "record_type": normalized_type, "rows": rows,
             "unique_answers": unique_answers, "unique_count": len(unique_answers),
