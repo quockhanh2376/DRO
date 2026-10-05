@@ -36,6 +36,7 @@ def create_app(database: Database | None = None, benchmark_cycle=run_benchmark_c
     @asynccontextmanager
     async def lifespan(_application):
         worker = SchedulerWorker(scheduler_database, benchmark_cycle, coordinator)
+        application.state.scheduler_worker = worker
         worker.start()
         try:
             yield

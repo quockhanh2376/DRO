@@ -1,6 +1,7 @@
 {% extends "base.html" %}{% block title %}Dashboard{% endblock %}
 {% block content %}
-<div class="page-heading"><div><p class="eyebrow">Overview</p><h1>Dashboard</h1></div><a class="button" href="/targets">Manage targets</a></div>
+<div class="page-heading"><div><p class="eyebrow">Overview</p><h1>Dashboard</h1></div><div class="dashboard-header-actions"><button class="button secondary diagnostics-button" id="run-diagnostics" type="button" data-url="/diagnostics/run" data-csrf="{{ csrf_token }}">Run Diagnostics</button><a class="button" href="/targets">Manage targets</a></div></div>
+<div id="diagnostics-result" aria-live="polite"></div>
 <section class="dashboard-overview"><h2>Overview / Targets dashboard</h2><div class="table-wrap"><table><thead><tr><th>Target</th><th>Current IP</th><th>Best candidate</th><th>Current avg</th><th>Best avg</th><th>Improvement</th><th>Win state</th><th>Mode</th><th>Status</th><th>Last test</th><th>Next test</th></tr></thead>
 <tbody>{% for row in rows %}<tr><td><a href="/targets/{{ row.target.id }}">{{ row.target.hostname }}</a></td>
 <td>{% if row.current_lookup_succeeded %}{{ row.current_ip or "Unavailable" }}{% else %}<span class="unavailable-value">Unavailable</span><small class="current-ip-reason">AdGuard read failed</small>{% endif %}</td><td>{{ row.best.ip if row.best else "—" }}</td>

@@ -218,6 +218,11 @@ class SchedulerWorker:
             self._thread = threading.Thread(target=self._loop, name="dro-scheduler", daemon=True)
             self._thread.start()
 
+    @property
+    def is_running(self) -> bool:
+        """Read-only worker liveness for operational diagnostics."""
+        return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread:

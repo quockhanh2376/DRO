@@ -36,6 +36,7 @@ from app.integrations.adguard import AdGuardError, configured_adguard_client
 from app.db.repositories import add_rewrite_history
 from app.core.live_ping import PingLimitReached, PingSession, ping_sessions
 from app.core.dns_checker import DNSCheckInputError, check_dns
+from app.core.system_diagnostics import run_diagnostics
 from app.time_utils import format_vietnam_time, next_run_time
 from app.version import VERSION_DISPLAY
 
@@ -283,6 +284,28 @@ def _latest_run_map(session: Session, targets: list[TargetRecord],
 @router.get("/", response_class=HTMLResponse, name="dashboard", dependencies=[Depends(require_admin)])
 def dashboard(request: Request, session: Session = Depends(get_session)):
     return _settings_response(request, session)
+
+
+@router.post("/diagnostics/run", response_class=HTMLResponse, name="run_diagnostics",
+             dependencies=[Depends(protect_mutation)])
+def run_dashboard_diagnostics(request: Request, session: Session = Depends(get_session)):
+    targets = list_targets(session)
+    coordinator = request.app.state.run_coordinator
+    queue_states = [coordinator.state(target.id) for target in targets]
+    worker = getattr(request.app.state, "scheduler_worker", None)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().casefold()
+    result = run_diagnostics(
+        targets=targets,
+        adguard_client_factory=configured_adguard_client,
+        scheduler_enabled=scheduler_enabled(session),
+        scheduler_running=bool(worker and worker.is_running),
+        queue_states=queue_states,
+        https_reached=request.url.scheme.casefold() == "https" or forwarded_proto == "https",
+    )
+    response = templates.TemplateResponse(request, "diagnostics_result.html",
+                                          _base_context(request, result=result))
+    response.headers.update(NO_CACHE_HEADERS)
+    return response
 
 
 @router.get("/targets", response_class=HTMLResponse, name="targets_page", dependencies=[Depends(require_admin)])

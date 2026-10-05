@@ -101,6 +101,12 @@ def test_dashboard_and_targets_render(web):
     assert dashboard.status_code == 200
     assert client.app.version == "1.0.8" and "v1.0.8" in dashboard.text
     assert "Dashboard" in dashboard.text and "Runtime Settings" in dashboard.text
+    header = dashboard.text.split('class="page-heading"', 1)[1].split('class="dashboard-overview"', 1)[0]
+    assert header.index('id="run-diagnostics"') < header.index('href="/targets"')
+    assert "Run Diagnostics" in header and "Manage targets" in header
+    assert 'id="diagnostics-result"' in dashboard.text
+    assert 'class="diagnostics-panel"' not in dashboard.text
+    assert dashboard.text.index('id="diagnostics-result"') < dashboard.text.index('class="dashboard-overview"')
     assert dashboard.text.index("</table>") < dashboard.text.index('id="settings"')
     assert all(f'name="{name}"' in dashboard.text for name in (
         "value", "unit", "enabled", "max_auto_changes_per_day", "days", "csrf_token"))
@@ -1892,3 +1898,86 @@ def test_manual_benchmark_queue_runs_two_then_fifo_and_updates_independent_rows(
     finally:
         for event in release.values():
             event.set()
+
+
+def test_dashboard_diagnostics_post_is_read_only_and_formats_vntime(web, monkeypatch):
+    import app.core.system_diagnostics as diagnostics
+    import app.web.routes as web_routes
+    from datetime import datetime, timezone
+    from app.db.models import (BenchmarkRunRecord, OptimizerStateRecord, ScheduleStateRecord,
+                               SettingRecord)
+
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="diagnostic.example"))
+        run = save_benchmark_run(session, target.id, [], {}, DecisionResult(action="KEEP", reason="no change"))
+        next_run = datetime(2026, 10, 7, 1, 0, tzinfo=timezone.utc)
+        state = OptimizerStateRecord(target_id=target.id, current_rewrite_ip="192.0.2.44",
+                                     pending_candidate_ip="192.0.2.45", consecutive_wins=2)
+        schedule = ScheduleStateRecord(target_id=target.id, next_run_at=next_run)
+        session.add_all([state, schedule, SettingRecord(key="scheduler_enabled", value="true")])
+        session.commit()
+        target_id, run_id = target.id, run.id
+
+    class ReadOnlyAdGuard:
+        def list_rewrites(self):
+            return [{"domain": "diagnostic.example", "answer": "192.0.2.44"}]
+        def close(self): pass
+
+    monkeypatch.setattr(web_routes, "configured_adguard_client", ReadOnlyAdGuard)
+    monkeypatch.setattr(diagnostics, "_resolve", lambda *_args: ["192.0.2.44"])
+    monkeypatch.setattr(diagnostics, "_connect", lambda *_args: True)
+    monkeypatch.setattr(diagnostics, "_connect_https", lambda *_args: True)
+
+    rejected = client.post("/diagnostics/run", headers={"x-csrf-token": "invalid"})
+    assert rejected.status_code == 403
+    response = client.post("/diagnostics/run", headers={
+        "x-csrf-token": client.headers["x-csrf-token"], "x-forwarded-proto": "https",
+    })
+    assert response.status_code == 200
+    assert "System Diagnostics" in response.text
+    assert "Overall: Healthy" in response.text
+    assert "AdGuard Rewrite Read" in response.text and "1 rewrite readable" in response.text
+    assert "Enabled target checks (1/1 healthy)" in response.text
+    assert "diagnostic.example" in response.text
+    assert re.search(r"Last run: <time>\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2} VNTime</time>", response.text)
+    assert "ui-secret" not in response.text and "ADGUARD_PASS" not in response.text
+    assert response.headers["cache-control"].startswith("private, no-store")
+
+    with database.session() as session:
+        current_state = session.get(OptimizerStateRecord, target_id)
+        current_schedule = session.get(ScheduleStateRecord, target_id)
+        assert (current_state.current_rewrite_ip, current_state.pending_candidate_ip,
+                current_state.consecutive_wins) == ("192.0.2.44", "192.0.2.45", 2)
+        assert current_schedule.next_run_at == next_run.replace(tzinfo=None)
+        assert session.get(BenchmarkRunRecord, run_id) is not None
+        assert session.query(BenchmarkRunRecord).count() == 1
+        assert session.query(RewriteHistoryRecord).count() == 0
+        assert session.query(AuditLogRecord).count() == 0
+        assert session.get(SettingRecord, "scheduler_enabled").value == "true"
+
+
+def test_diagnostics_frontend_disables_button_and_posts_once_without_refresh(web):
+    client, _database = web
+    script = client.get("/static/diagnostics.js").text
+    assert 'event.target.closest("#run-diagnostics")' in script
+    assert "if (!button || activeRequest) return" in script
+    assert "button.disabled = true" in script
+    assert 'method: "POST"' in script
+    assert '"X-CSRF-Token": button.dataset.csrf' in script
+    assert "location.reload" not in script and 'window.location' not in script
+    assert "result.innerHTML = await response.text()" in script
+    css = client.get("/static/style.css").text
+    assert ".diagnostics-healthy{color:var(--good)}" in css
+    assert ".diagnostics-warning{color:#f1c978}" in css
+    assert ".diagnostics-failed{color:var(--danger)}" in css
+    assert "@media(max-width:650px)" in css and ".diagnostics-table{min-width:540px}" in css
+
+
+def test_diagnostics_route_requires_authenticated_admin(web):
+    client, _database = web
+    client.cookies.clear()
+    response = client.post("/diagnostics/run", headers={"x-csrf-token": "irrelevant"},
+                           follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"

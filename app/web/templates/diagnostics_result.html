@@ -1,0 +1,10 @@
+<section class="diagnostics-panel" aria-labelledby="diagnostics-heading">
+  <div class="diagnostics-heading"><h2 id="diagnostics-heading">System Diagnostics</h2><span class="diagnostics-overall diagnostics-{{ result.overall }}">Overall: {{ result.overall|capitalize }}</span></div>
+  <p class="diagnostics-last-run">Last run: <time>{{ result.last_run|vn_time }}</time></p>
+  <div class="table-wrap diagnostics-table-wrap"><table class="diagnostics-table"><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>
+    {% for check in result.checks %}<tr><td>{{ check.name }}</td><td><span class="diagnostics-status diagnostics-{{ check.status }}">{{ check.status|capitalize }}</span></td><td>{{ check.detail }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% if result.targets %}<details class="diagnostics-targets"><summary>Enabled target checks ({{ result.targets|selectattr('status', 'equalto', 'healthy')|list|length }}/{{ result.targets|length }} healthy)</summary><div class="table-wrap diagnostics-table-wrap"><table class="diagnostics-table"><thead><tr><th>Target</th><th>Status</th><th>Detail</th></tr></thead><tbody>
+    {% for target in result.targets %}<tr><td>{{ target.hostname }}</td><td><span class="diagnostics-status diagnostics-{{ target.status }}">{{ target.status|capitalize }}</span></td><td>{{ target.detail }}</td></tr>{% endfor %}
+  </tbody></table></div></details>{% endif %}
+</section>
