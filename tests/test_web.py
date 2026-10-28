@@ -15,6 +15,7 @@ from app.db.repositories import (add_rewrite_history, get_setting, save_benchmar
                                  save_optimizer_state, save_target)
 from app.models.benchmark import BenchmarkResult, DecisionResult, PendingCandidateState
 from app.models.target import Target
+from app.version import VERSION_DISPLAY
 from sqlalchemy import select
 
 
@@ -26,6 +27,23 @@ def web(tmp_path, monkeypatch):
     database = Database(f"sqlite:///{(tmp_path / 'web.db').as_posix()}")
     Base.metadata.create_all(database.engine)
     app = create_app(database=database, benchmark_cycle=lambda *_args: {})
+    import app.web.routes as web_routes
+
+    class TestPageAdGuard:
+        def list_rewrites(self):
+            with database.session() as session:
+                targets = session.scalars(select(TargetRecord)).all()
+            rewrites = []
+            for target in targets:
+                ip, succeeded = web_routes.read_adguard_rewrite(target.hostname)
+                if not succeeded:
+                    raise RuntimeError("simulated AdGuard list read failure")
+                if succeeded and ip:
+                    rewrites.append({"domain": target.hostname, "answer": ip})
+            return rewrites
+        def close(self): pass
+
+    monkeypatch.setattr(web_routes, "configured_adguard_client", TestPageAdGuard)
     with TestClient(app) as client:
         login_page = client.get("/login")
         csrf = re.search(r'name="csrf_token" value="([^"]+)"', login_page.text).group(1)
@@ -37,12 +55,58 @@ def web(tmp_path, monkeypatch):
     database.close()
 
 
+def test_global_header_uses_central_version_on_authenticated_pages(web, monkeypatch):
+    import app.web.routes as web_routes
+
+    client, database = web
+    assert VERSION_DISPLAY == "v1.0.8"
+    monkeypatch.setattr(web_routes, "VERSION_DISPLAY", "v9.8.7-test")
+    with database.session() as session:
+        target = save_target(session, Target(hostname="version.example"))
+
+    for path in ("/", "/targets", f"/targets/{target.id}", "/history"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert '<a class="brand" href="/">DRO <span class="brand-version">v9.8.7-test</span></a>' in response.text
+        assert response.text.count("v9.8.7-test") == 1
+        assert 'class="app-version"' not in response.text
+
+
+def test_runtime_version_is_only_shown_in_global_header(web):
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="version-once.example"))
+
+    for path in ("/", "/targets", f"/targets/{target.id}", "/history"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.text.count(VERSION_DISPLAY) == 1
+        assert response.text.count('class="brand-version"') == 1
+
+    login = client.get("/login")
+    assert VERSION_DISPLAY not in login.text
+
+
+def test_global_header_version_is_small_and_regular_weight():
+    stylesheet = (Path(__file__).parents[1] / "app/web/static/style.css").read_text()
+    rules = re.search(r"\.brand\s+\.brand-version\{([^}]*)\}", stylesheet)
+    assert rules
+    assert "font-size:16px" in rules.group(1)
+    assert "font-weight:400" in rules.group(1)
+
+
 def test_dashboard_and_targets_render(web):
     client, _database = web
     dashboard = client.get("/")
     assert dashboard.status_code == 200
-    assert client.app.version == "1.0.0rc1" and "v1.0.0-rc.1" in dashboard.text
+    assert client.app.version == "1.0.8" and "v1.0.8" in dashboard.text
     assert "Dashboard" in dashboard.text and "Runtime Settings" in dashboard.text
+    header = dashboard.text.split('class="page-heading"', 1)[1].split('class="dashboard-overview"', 1)[0]
+    assert header.index('id="run-diagnostics"') < header.index('href="/targets"')
+    assert "Run Diagnostics" in header and "Manage targets" in header
+    assert 'id="diagnostics-result"' in dashboard.text
+    assert 'class="diagnostics-panel"' not in dashboard.text
+    assert dashboard.text.index('id="diagnostics-result"') < dashboard.text.index('class="dashboard-overview"')
     assert dashboard.text.index("</table>") < dashboard.text.index('id="settings"')
     assert all(f'name="{name}"' in dashboard.text for name in (
         "value", "unit", "enabled", "max_auto_changes_per_day", "days", "csrf_token"))
@@ -71,6 +135,169 @@ def test_dashboard_and_targets_render(web):
     assert 'id="benchmark-indicator-' not in targets_page
     assert 'id="run-result-1"' in targets_page
     assert targets_page.index('id="run-result-1"') < targets_page.index("</table>")
+
+
+def test_dns_checker_ui_is_inside_add_target_card_and_separate_from_target_form(web):
+    client, _database = web
+    page = client.get("/targets").text
+    card = page.split('<section class="panel">', 1)[1].split('<section class="table-wrap">', 1)[0]
+    assert "CHECK DNS" in card
+    assert card.index('id="dns-check-form"') < card.index('id="dns-check-result"')
+    assert card.index('id="dns-check-result"') < card.index('class="target-form"')
+    assert ".dns-check-result" not in card
+    assert 'name="hostname"' in card and 'id="dns-check-hostname"' in card
+    assert 'name="record_type"' in card
+    assert re.search(r'<option value="A" selected>A</option>', card)
+    assert all(f'<option value="{kind}"' in card for kind in ("AAAA", "CNAME", "MX", "TXT"))
+    assert card.count(">Check DNS</button>") == 1
+    assert 'id="hostname"' not in card
+    assert 'id="dns-check-result" aria-live="polite"' in card
+    script = client.get("/static/targets.js").text
+    assert 'event.target.closest("#dns-check-form")' in script
+    assert 'button.textContent = "Checking..."' in script
+    assert 'button.textContent = originalText' in script
+    assert 'result.innerHTML = await response.text()' in script
+
+
+def test_dns_check_post_renders_results_without_touching_dro_state(web, monkeypatch):
+    import app.web.routes as web_routes
+    from app.core.dns_checker import RESOLVER_PROFILES
+    from app.db.models import OptimizerStateRecord
+
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="dns-isolation.example"))
+        state = OptimizerStateRecord(target_id=target.id, current_rewrite_ip="192.0.2.44")
+        session.add(state)
+        session.commit()
+        target_id = target.id
+    rows = [{"name": profile.name, "region": profile.region, "answers": ["192.0.2.4"],
+             "response_ms": 10.0 + index, "status": "OK", "status_class": "ok",
+             "fastest": index == 2} for index, profile in enumerate(RESOLVER_PROFILES)]
+    rows[0]["answers"] = ["108.157.32.65", "108.157.32.71", "108.157.32.2", "108.157.32.25"]
+    fake_result = {"hostname": "example.com", "record_type": "A", "rows": rows,
+                   "unique_answers": ["192.0.2.4"], "unique_count": 1,
+                   "resolver_count": len(rows), "successful_count": len(rows),
+                   "failed_count": 0, "overall_class": "ok"}
+    calls = []
+    monkeypatch.setattr(web_routes, "check_dns", lambda hostname, kind: calls.append((hostname, kind)) or fake_result)
+    monkeypatch.setattr(web_routes, "configured_adguard_client",
+                        lambda: (_ for _ in ()).throw(AssertionError("AdGuard must not be called")))
+    response = client.post("/targets/dns-check", data={
+        "csrf_token": client.headers["x-csrf-token"], "hostname": "Example.com", "record_type": "A",
+    })
+    assert response.status_code == 200
+    assert "DNS Check Result: example.com" in response.text
+    assert "Google" in response.text and "Cloudflare" in response.text
+    assert "Country / Region" in response.text and "Fastest" in response.text
+    for region in ("Vietnam", "Singapore", "Malaysia", "Hong Kong", "Australia", "Japan"):
+        assert f">{region}</td>" in response.text
+    assert response.text.count('class="dns-fastest-badge"') == 1
+    assert 'class="dns-answer-list dns-answer-ip-grid"' in response.text
+    assert 'class="dns-ip-badge dns-ip-badge-unique"' in response.text
+    assert 'class="dns-answer-value dns-ip-badge dns-ip-badge-answer">108.157.32.65</code>' in response.text
+    for answer in rows[0]["answers"]:
+        assert f'>{answer}</code>' in response.text
+    assert "dns-check-fastest" in response.text
+    css = client.get("/static/style.css").text
+    assert ".dns-check-table .dns-col-answer{width:43%}" in css
+    assert ".dns-check-result code.dns-answer-value" in css
+    assert ".dns-check-result code.dns-ip-badge{color:#7CFF9B;background:#050807" in css
+    assert ".dns-check-result code.dns-ip-badge-unique{font-size:14px}" in css
+    assert ".dns-check-result code.dns-ip-badge-answer{font-size:16px}" in css
+    assert "text-overflow:ellipsis" not in css.split(".dns-answer-list", 1)[1].split("}", 1)[0]
+    assert "grid-template-columns:minmax(0,1fr)" in css.split("@media(max-width:700px)", 1)[1]
+    assert "Unique answers: <strong>1</strong>" in response.text
+    assert calls == [("Example.com", "A")]
+    with database.session() as session:
+        assert session.scalar(select(TargetRecord).where(TargetRecord.id == target_id)).hostname == "dns-isolation.example"
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.44"
+        assert session.query(RewriteHistoryRecord).count() == 0
+        assert session.query(AuditLogRecord).count() == 0
+
+
+@pytest.mark.parametrize("record_type", ["TXT", "CNAME"])
+def test_dns_check_long_text_answers_use_wrapping_single_column(web, monkeypatch, record_type):
+    import app.web.routes as web_routes
+    from app.core.dns_checker import RESOLVER_PROFILES
+
+    client, _database = web
+    long_value = ("verification-token-" * 14) if record_type == "TXT" else "very-long-cdn-alias." * 8 + "example.net"
+    rows = [{"name": profile.name, "region": profile.region, "answers": [long_value, long_value + "-second"],
+             "response_ms": 10.0 + index, "status": "OK", "status_class": "ok",
+             "fastest": index == 0} for index, profile in enumerate(RESOLVER_PROFILES)]
+    fake_result = {"hostname": "example.com", "record_type": record_type, "rows": rows,
+                   "unique_answers": [], "unique_count": 0, "resolver_count": len(rows),
+                   "successful_count": len(rows), "failed_count": 0, "overall_class": "ok"}
+    monkeypatch.setattr(web_routes, "check_dns", lambda *_args: fake_result)
+    response = client.post("/targets/dns-check", data={
+        "csrf_token": client.headers["x-csrf-token"], "hostname": "example.com", "record_type": record_type,
+    })
+    assert response.status_code == 200
+    assert 'class="dns-answer-list dns-answer-text-list"' in response.text
+    assert f'class="dns-answer-value">{long_value}</code>' in response.text
+    assert f'class="dns-answer-value">{long_value}-second</code>' in response.text
+    assert "dns-ip-badge" not in response.text
+    assert 'class="dns-answer-list dns-answer-ip-grid"' not in response.text
+    css = client.get("/static/style.css").text
+    assert ".dns-check-result code.dns-answer-value" in css
+    assert "overflow-wrap:anywhere" in css
+
+
+def test_dns_check_rejects_invalid_hostname_and_enforces_auth_and_csrf(web, monkeypatch):
+    import app.web.routes as web_routes
+
+    client, _database = web
+    from app.core.dns_checker import DNSCheckInputError
+    monkeypatch.setattr(web_routes, "check_dns", lambda *_args: (_ for _ in ()).throw(
+        DNSCheckInputError("Enter a valid hostname.")))
+    response = client.post("/targets/dns-check", data={
+        "csrf_token": client.headers["x-csrf-token"], "hostname": "https://example.com", "record_type": "A",
+    })
+    assert response.status_code == 200 and "Enter a valid hostname." in response.text
+    rejected_csrf = client.post("/targets/dns-check", data={
+        "csrf_token": "wrong", "hostname": "example.com", "record_type": "A",
+    }, headers={"x-csrf-token": "wrong"})
+    assert rejected_csrf.status_code == 403
+    client.cookies.clear()
+    unauthenticated = client.post("/targets/dns-check", data={
+        "csrf_token": "unused", "hostname": "example.com", "record_type": "A",
+    }, follow_redirects=False)
+    assert unauthenticated.status_code == 303 and unauthenticated.headers["location"] == "/login"
+
+
+@pytest.mark.parametrize(("value", "text", "css_class"), [
+    (0.0, "0.0%", "improvement-low"),
+    (3.5, "3.5%", "improvement-low"),
+    ("6.0%", "6.0%", "improvement-medium"),
+    (9.9, "9.9%", "improvement-medium"),
+    (10.0, "10.0%", "improvement-high"),
+    (12.4, "12.4%", "improvement-high"),
+    (19.9, "19.9%", "improvement-high"),
+    (20.0, "20.0%", "improvement-very-high"),
+    (26.3, "26.3%", "improvement-very-high"),
+    (None, "—", "improvement-low"),
+    ("—", "—", "improvement-low"),
+    ("unavailable", "—", "improvement-low"),
+    ("not a percentage", "—", "improvement-low"),
+])
+def test_dashboard_improvement_display_classes(value, text, css_class):
+    from app.web.routes import _improvement_display
+
+    assert _improvement_display(value) == {"text": text, "css_class": css_class}
+
+
+def test_dashboard_improvement_classes_are_scoped_to_value_only():
+    from app.web.routes import templates
+
+    source = (Path(__file__).parents[1] / "app/web/templates/dashboard.html").read_text()
+    cell = re.search(r"<td><span class=\"\{\{ improvement\.css_class \}\}\">"
+                     r"\{\{ improvement\.text \}\}</span></td>", source)
+    stylesheet = (Path(__file__).parents[1] / "app/web/static/style.css").read_text()
+    assert cell
+    assert all(f".{name}" in stylesheet for name in (
+        "improvement-low", "improvement-medium", "improvement-high", "improvement-very-high"))
+    assert "improvement_display" in templates.env.globals
 
 
 def test_targets_form_is_compact_and_actions_are_play_edit_delete(web):
@@ -107,6 +334,161 @@ def test_targets_form_is_compact_and_actions_are_play_edit_delete(web):
     assert 'navigator.clipboard.writeText(value)' in client.get("/static/targets.js").text
 
 
+def test_targets_are_alphabetical_numbered_and_search_controls_are_wired(web):
+    client, database = web
+    with database.session() as session:
+        z_target = save_target(session, Target(hostname="zulu.example"))
+        m_target = save_target(session, Target(hostname="Myob.com"))
+        a_target = save_target(session, Target(hostname="accounts.intuit.com"))
+        ids = {"zulu.example": z_target.id, "myob.com": m_target.id,
+               "accounts.intuit.com": a_target.id}
+    page = client.get("/targets").text
+    blocks = re.findall(r'<tbody class="target-block" data-target-id="(\d+)" data-hostname="([^"]+)"', page)
+    assert [hostname for _target_id, hostname in blocks] == [
+        "accounts.intuit.com", "myob.com", "zulu.example"]
+    assert [int(re.search(r'<td class="target-sequence">(\d+)</td>',
+                          page.split(f'data-target-id="{target_id}"', 1)[1].split("</tbody>", 1)[0]).group(1))
+            for target_id, _hostname in blocks] == [1, 2, 3]
+    for hostname, target_id in ids.items():
+        assert f'id="target-block-{target_id}"' in page
+        assert f'data-hostname="{hostname}"' in page
+    card = page.split('class="panel"', 1)[1].split("</section>", 1)[0]
+    assert card.index('class="target-search"') < card.index('class="target-form"')
+    assert 'id="target-search-input"' in card and 'type="search"' in card
+    assert '<div class="target-search"' in card and '<form class="target-search"' not in card
+    assert 'onsubmit="return false"' not in card
+    assert '<form id="dns-check-form"' in card and '<form method="post" action="/targets"' in card
+    assert card.count('class="target-search-clear"') == 1
+    assert 'id="target-search-clear"' in card and 'title="Clear search"' in card
+    search_field = card.split('class="target-search-field"', 1)[1].split("</div>", 1)[0]
+    assert 'class="target-search-input"' in search_field
+    assert 'class="target-search-clear"' in search_field
+    assert '>Search</button>' not in page
+    for target_id, _hostname in blocks:
+        tbody = page.split(f'data-target-id="{target_id}"', 1)[1].split("</tbody>", 1)[0]
+        assert f'id="target-block-{target_id}"' in tbody
+        assert f'id="ping-result-{target_id}"' in tbody
+        assert f'id="run-result-{target_id}"' in tbody
+        assert f'hx-target="#run-state-poll-{target_id}"' in tbody
+    script = client.get("/static/targets.js").text
+    assert 'document.addEventListener("input"' in script
+    assert 'event.target.matches("#target-search-input")' in script
+    input_handler = script.split('document.addEventListener("input"', 1)[1].split('document.addEventListener("click"', 1)[0]
+    assert "reorderTargetBlocks(event.target)" in input_handler
+    assert "setTimeout" not in input_handler and "fetch(" not in input_handler
+    assert "preventDefault" not in input_handler and "htmx" not in input_handler.lower()
+    assert "window.droTargetSearchHandlersInstalled" in script
+    assert 'document.addEventListener("click"' in script
+    assert 'input.value = ""' in script and 'input.focus()' in script
+    assert "reorderTargetBlocks(event.target)" in script and "reorderTargetBlocks(input)" in script
+    assert 'name === query ? 0 : name.startsWith(query) ? 1 : name.includes(query) ? 2 : 3' in script
+    assert 'targetSearchCollator.compare(a.dataset.hostname, b.dataset.hostname)' in script
+    assert 'document.addEventListener("click"' in script
+    assert 'input.focus()' in script and 'input.value = ""' in script
+    assert 'table.appendChild(block)' in script and 'target-sequence' in script
+    assert 'querySelectorAll("tbody.target-block[data-hostname]")' in script
+    assert 'blocks.forEach((block) => {' in script
+    assert 'block.classList.remove("search-match", "search-best-match", "search-exact-match")' in script
+    assert 'block.classList.add("search-match")' in script
+    assert 'block.classList.add("search-best-match")' in script
+    assert 'block.classList.add("search-exact-match")' in script
+    assert 'if (!query) return' in script
+    stylesheet = client.get("/static/style.css").text
+    search_input_style = stylesheet.split(".target-search-input{", 1)[1].split("}", 1)[0]
+    assert "padding:8px 43px 8px 11px" in search_input_style
+    assert "font:400 17px/1.35" in search_input_style
+    assert ".target-search-input::placeholder{color:var(--muted);font:inherit" in stylesheet
+    assert ".target-search-clear{position:absolute" in stylesheet
+    assert ".target-search-field{position:relative" in stylesheet
+    assert ".target-block.search-match .benchmark-hostname" in stylesheet
+    assert ".target-block.search-best-match .benchmark-hostname" in stylesheet
+    assert ".target-block.search-exact-match .benchmark-hostname" in stylesheet
+    search_styles = stylesheet.split(".target-block.search-match", 1)[1]
+    assert "animation:" not in search_styles.split("@media", 1)[0]
+
+
+def test_live_target_search_ranking_contract_for_xero_and_clear(web):
+    client, database = web
+    with database.session() as session:
+        for hostname in ("zeta.example", "reporting.xero.com", "go.xero.com",
+                         "app.practicemanager.xero.com", "xero.example", "accounts.intuit.com",
+                         "alpha.xero.net", "xero-tools.example"):
+            save_target(session, Target(hostname=hostname))
+    script = client.get("/static/targets.js").text
+    rank_start = script.index("const rank = (name)")
+    rank_end = script.index("const ordered =", rank_start)
+    rank_expression = script[rank_start:rank_end]
+    assert rank_expression.index("name === query") < rank_expression.index("name.startsWith(query)")
+    assert rank_expression.index("name.startsWith(query)") < rank_expression.index("name.includes(query)")
+    assert "rank(left) - rank(right) || targetSearchCollator.compare" in script
+    assert 'const query = input.value.trim().toLocaleLowerCase()' in script
+    assert 'querySelectorAll("tbody.target-block[data-hostname]")' in script
+    assert "const originalOrder = [...blocks].sort" in script and 'input.value = ""' in script
+    assert 'document.addEventListener("htmx:afterSwap"' in script
+    assert "if (input) reorderTargetBlocks(input)" in script
+    # Whole target blocks retain ping and benchmark result rows during reordering.
+    page = client.get("/targets").text
+    assert 'class="target-block" data-target-id=' in page
+    blocks = re.findall(r'<tbody class="target-block" data-target-id="\d+" data-hostname="([^"]+)"', page)
+    assert blocks == ["accounts.intuit.com", "alpha.xero.net", "app.practicemanager.xero.com",
+                      "go.xero.com", "reporting.xero.com", "xero-tools.example", "xero.example", "zeta.example"]
+    body_template = page.split('class="target-block"', 1)[1].split("</tbody>", 1)[0]
+    assert 'class="ping-row"' in body_template and 'class="run-result-row"' in body_template
+    assert "rank(left) - rank(right)" in script
+    # Query "xero": prefix first, then substring matches A-Z, then non-matches A-Z.
+    expected = ["xero-tools.example", "alpha.xero.net", "app.practicemanager.xero.com",
+                "go.xero.com", "reporting.xero.com", "xero.example",
+                "accounts.intuit.com", "zeta.example"]
+    assert expected[:6] == ["xero-tools.example", "alpha.xero.net",
+                            "app.practicemanager.xero.com", "go.xero.com",
+                            "reporting.xero.com", "xero.example"]
+    assert "index + 1" in script and 'sequence.textContent = String(index + 1)' in script
+
+
+def test_target_search_updates_every_input_and_clear_without_form_or_request(web):
+    client, _database = web
+    page = client.get("/targets").text
+    script = client.get("/static/targets.js").text
+    search = script.split("// Install delegated search handlers once", 1)[1].split("})();", 1)[0]
+    input_handler = search.split('document.addEventListener("input"', 1)[1].split(
+        'document.addEventListener("click"', 1)[0]
+    assert "reorderTargetBlocks(event.target)" in input_handler
+    assert "setTimeout" not in input_handler and "fetch(" not in input_handler
+    assert "preventDefault" not in input_handler and "htmx" not in input_handler.lower()
+    # The native input event fires on character entry, deletion, and backspace.
+    assert 'event.target.matches("#target-search-input")' in input_handler
+    clear_handler = search.split('document.addEventListener("click"', 1)[1].split(
+        'document.addEventListener("htmx:afterSwap"', 1)[0]
+    assert 'input.value = ""' in clear_handler
+    assert "reorderTargetBlocks(input)" in clear_handler and "input.focus()" in clear_handler
+    assert "window.droTargetSearchHandlersInstalled" in script
+    assert 'id="target-search" role="search"' in page
+    assert '<form class="target-search"' not in page
+    assert '<form id="dns-check-form"' in page
+    assert 'class="target-form"' in page
+    htmx_handler = search.split('document.addEventListener("htmx:afterSwap"', 1)[1]
+    assert "reorderTargetBlocks(input)" in htmx_handler
+    assert "const originalOrder = [...blocks].sort" in script
+
+
+def test_live_target_search_highlights_all_matches_and_clears_classes(web):
+    client, _database = web
+    script = client.get("/static/targets.js").text
+    apply_start = script.index('const matches = ordered.filter')
+    apply_end = script.index("})();", apply_start)
+    feedback = script[apply_start:apply_end]
+    assert 'matches.forEach((block, index)' in feedback
+    assert 'block.classList.add("search-match")' in feedback
+    assert 'if (index === 0) block.classList.add("search-best-match")' in feedback
+    assert 'block.classList.add("search-exact-match")' in feedback
+    assert 'classList.remove("search-match", "search-best-match", "search-exact-match")' in script
+    css = client.get("/static/style.css").text
+    assert ".target-block.search-match .benchmark-hostname" in css
+    assert ".target-block.search-best-match .benchmark-hostname" in css
+    assert ".target-block.search-exact-match .benchmark-hostname" in css
+    assert "outline:2px solid #83d99a" in css
+
+
 def test_target_form_rejects_url_syntax_and_normalizes_hostname(web):
     client, database = web
     rejected = client.post("/targets", data={"hostname": "https://example.com"})
@@ -134,7 +516,8 @@ def test_unresolvable_valid_hostname_renders_diagnostic_state(web):
         target_id = target.id
     page = client.get(f"/targets/{target_id}").text
     assert 'class="unavailable-value">Unavailable</span>' in page
-    assert page.count('class="unavailable-value">Unavailable</span>') == 2
+    assert page.count('class="unavailable-value">Unavailable</span>') >= 2
+    assert "AdGuard read failed" in page
     assert "No valid IP found" in page
     assert "Unable to resolve this domain. Please double-check the hostname and try again." in page
     assert "RESOLUTION FAILED" in page
@@ -145,6 +528,42 @@ def test_unresolvable_valid_hostname_renders_diagnostic_state(web):
     css = client.get("/static/style.css").text
     assert ".unavailable-value{color:var(--danger);font-weight:700}" in css
     assert ".resolution-warning{" in css and ".resolution-failed-badge{" in css
+
+
+def test_unhealthy_current_without_healthy_alternative_stays_critical_and_no_apply(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    hostname = "www.ato.gov.au"
+    with database.session() as session:
+        target = save_target(session, Target(hostname=hostname, mode="auto", auto_apply=True))
+        failed = BenchmarkResult(ip="113.171.12.192", healthy=False, valid_runs=0, requested_runs=10,
+                                 health_reason="TLS verification failed")
+        current = BenchmarkResult(ip="113.171.12.178", healthy=False, valid_runs=0, requested_runs=10,
+                                  health_reason="HTTP 403 outside accepted range 200-399")
+        save_benchmark_run(session, target.id, [failed, current], {
+            "resolution_failed": False, "current_rewrite_ip": current.ip,
+            "current_rewrite_lookup_succeeded": True,
+            "public_ips": [failed.ip], "candidate_ips": [failed.ip, current.ip],
+            "candidate_health_reasons": {failed.ip: "10x TLS certificate verification failure",
+                                         current.ip: "10x HTTP 403"},
+            "failure_summary": "10x TLS certificate verification failure; 10x HTTP 403",
+        }, DecisionResult(action="KEEP", current_ip=current.ip,
+                          reason="Current IP is unhealthy and no healthy alternative is available."))
+        save_optimizer_state(session, target.id, current.ip, PendingCandidateState(),
+                             DecisionResult(action="KEEP", current_ip=current.ip,
+                                            reason="Current IP is unhealthy and no healthy alternative is available."))
+        target_id = target.id
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _host: (current.ip, True))
+    detail = client.get(f"/targets/{target_id}").text
+    dashboard = client.get("/").text
+    assert "Current IP is unhealthy and no healthy alternative is available." in detail
+    assert "113.171.12.192" in detail and "10x TLS certificate verification failure" in detail
+    assert "10x HTTP 403" in detail
+    assert "No healthy candidate: 10x TLS certificate verification failure; 10x HTTP 403." in detail
+    assert ">Critical<" in dashboard
+    assert "Best IP" in detail and "Apply Best IP" not in detail
+    assert f'action="/targets/{target_id}/apply-best"' not in detail
+    assert "Auto Apply" not in detail
 
 
 def test_global_and_target_auto_apply_controls_require_both_opt_ins(web):
@@ -297,13 +716,14 @@ def test_live_ping_start_selects_best_and_renders_console_with_stop_control(web,
         def start(self, identifier, ip):
             calls.append((identifier, ip))
             return SimpleNamespace(target_id=identifier, ip=ip, lines=["64 bytes from 192.0.2.11: time=4 ms"],
-                                   lock=Lock(), started_at=datetime.now(timezone.utc))
+                                   lock=Lock(), started_at=datetime(2026, 9, 27, 3, 0, tzinfo=timezone.utc))
 
     monkeypatch.setattr(web_routes, "ping_sessions", FakePings())
     response = client.post(f"/targets/{target_id}/ping", headers={"HX-Request": "true"})
     assert response.status_code == 200 and calls == [(target_id, "192.0.2.11")]
     assert f'hx-get="/targets/{target_id}/ping/output"' in page.text
     assert "Live ping" in response.text and "64 bytes from 192.0.2.11" in response.text
+    assert "27-09-2026 10:00:00 VNTime" in response.text
     assert f'/targets/{target_id}/ping/stop' in response.text
     assert 'aria-label="Stop ping"' in response.text
     assert "ping-live-spinner" in response.text
@@ -480,7 +900,7 @@ def test_ui_formats_database_timestamps_in_vietnam_time(web):
 
     client, database = web
     utc_instant = datetime(2026, 9, 27, 3, 0, tzinfo=timezone.utc)
-    expected = "2026-09-27 10:00:00 ICT"
+    expected = "27-09-2026 10:00:00 VNTime"
     with database.session() as session:
         target = save_target(session, Target(hostname="timezone.example"))
         run = save_benchmark_run(session, target.id, [], {}, None)
@@ -508,7 +928,7 @@ def test_target_pages_not_found_and_manual_run_redirect(web):
 
 def test_apply_best_button_requires_verified_current_and_healthy_different_best(web, monkeypatch):
     client, database = web
-    from app.core import optimizer
+    import app.web.routes as web_routes
 
     for index, (lookup_ok, best_healthy, best_ip) in enumerate((
             (True, True, "192.0.2.2"), (False, True, "192.0.2.2"),
@@ -522,12 +942,14 @@ def test_apply_best_button_requires_verified_current_and_healthy_different_best(
                 results.append(BenchmarkResult(ip=best_ip, healthy=best_healthy, valid_runs=10,
                                                requested_runs=10, average_ms=10, median_ms=10,
                                                min_ms=9, max_ms=11, jitter_ms=1))
-            run = save_benchmark_run(session, target.id, results, {
+            save_benchmark_run(session, target.id, results, {
                 "current_rewrite_ip": "192.0.2.1",
                 "current_rewrite_lookup_succeeded": lookup_ok,
             }, DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip=best_ip,
                               reason="Candidate is faster"))
             target_id = target.id
+        monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                            lambda _hostname: ("192.0.2.1", True) if lookup_ok else (None, False))
         page = client.get(f"/targets/{target_id}").text
         should_apply = lookup_ok and best_healthy and best_ip != "192.0.2.1"
         assert ("Apply Best IP" in page) is should_apply
@@ -541,6 +963,302 @@ def test_apply_best_button_requires_verified_current_and_healthy_different_best(
             assert "from 192.0.2.1 to 192.0.2.2" in page
 
 
+def test_apply_uses_live_adguard_rewrite_when_dro_cache_and_benchmark_are_stale(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="app.myob.com"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="108.157.32.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "108.157.32.2", "current_rewrite_lookup_succeeded": True,
+            "resolution_failed": False},
+            DecisionResult(action="UPDATE", current_ip="108.157.32.2", candidate_ip="108.157.32.2",
+                           reason="Healthy candidate"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="108.157.32.2"))
+        session.commit()
+
+    class FakeAdGuard:
+        current = "108.157.32.65"
+        update_calls = []
+        def get_rewrite(self, hostname):
+            assert hostname == "app.myob.com"
+            return {"domain": hostname, "answer": self.current}
+        def update_rewrite(self, old_domain, old_ip, domain, answer):
+            self.update_calls.append((old_domain, old_ip, domain, answer))
+            assert (old_domain, old_ip) == ("app.myob.com", "108.157.32.65")
+            self.current = answer
+        def add_rewrite(self, *_args): pytest.fail("Apply must update the existing rewrite")
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (fake.current, True))
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    monkeypatch.setattr(rewrites, "_healthy", lambda _target, _ip: True)
+
+    detail = client.get(f"/targets/{target_id}").text
+    inline = client.get("/targets").text
+    assert '<span>Current rewrite</span><strong><span class="ip-copy-value">108.157.32.65' in detail
+    assert 'class="benchmark-hostname">app.myob.com' in inline
+    inline_result = inline.split(f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    assert 'class="ip-copy-value">108.157.32.65' in inline_result
+    assert "Apply Best IP" in inline_result and ">Add to DNS</button>" not in inline_result
+
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "108.157.32.2", "new_ip": "108.157.32.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].endswith(
+        "?rewrite=applied&old_ip=108.157.32.65&new_ip=108.157.32.2")
+    assert fake.update_calls == [("app.myob.com", "108.157.32.65", "app.myob.com", "108.157.32.2")]
+    refreshed = client.get(response.headers["location"]).text
+    assert "DNS rewrite updated: 108.157.32.65 -&gt; 108.157.32.2" in refreshed
+    assert 'class="ip-copy-value">108.157.32.2' in refreshed
+    assert f'action="/targets/{target_id}/apply-best"' not in refreshed
+    second = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "108.157.32.65", "new_ip": "108.157.32.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert second.status_code == 303
+    assert second.headers["location"].endswith("?rewrite=already-applied&ip=108.157.32.2")
+    already = client.get(second.headers["location"]).text
+    assert "DNS rewrite already uses Best IP: 108.157.32.2" in already
+    assert f'action="/targets/{target_id}/apply-best"' not in already
+    assert len(fake.update_calls) == 1
+    with database.session() as session:
+        state = session.get(OptimizerStateRecord, target_id)
+        assert state.current_rewrite_ip == fake.current == "108.157.32.2"
+        history = session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+        assert len(history) == 1
+        assert (history[0].old_ip, history[0].new_ip) == ("108.157.32.65", "108.157.32.2")
+
+
+def test_apply_navigation_keeps_dashboard_targets_and_detail_on_adguard_current_ip(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="app.myob.com"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="108.157.32.71", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "108.157.32.2", "current_rewrite_lookup_succeeded": True,
+            "resolution_failed": False},
+            DecisionResult(action="UPDATE", current_ip="108.157.32.2", candidate_ip="108.157.32.71",
+                           reason="Healthy best candidate"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="108.157.32.2"))
+        session.commit()
+
+    class FakeAdGuard:
+        current = "108.157.32.2"
+        writes = []
+        list_calls = 0
+        def list_rewrites(self):
+            self.list_calls += 1
+            return [{"domain": "APP.MYOB.COM.", "answer": self.current}] if self.current else []
+        def get_rewrite(self, hostname): return {"domain": hostname, "answer": self.current}
+        def update_rewrite(self, old_domain, old_ip, domain, answer):
+            self.writes.append((old_domain, old_ip, domain, answer))
+            assert old_ip == self.current
+            self.current = answer
+        def add_rewrite(self, *_args): pytest.fail("existing rewrite must use update")
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (fake.current, True))
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    monkeypatch.setattr(rewrites, "_healthy", lambda _target, _ip: True)
+
+    initial_detail = client.get(f"/targets/{target_id}").text
+    initial_targets = client.get("/targets").text
+    target_block = initial_targets.split(f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    assert 'class="ip-copy-value">108.157.32.2' in initial_detail
+    assert 'class="ip-copy-value">108.157.32.2' in target_block
+    assert 'class="ip-copy-value">108.157.32.71' in target_block
+    assert f'action="/targets/{target_id}/apply-best"' in target_block
+
+    applied = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "108.157.32.2", "new_ip": "108.157.32.71", "confirm": "true",
+    }, follow_redirects=False)
+    assert applied.status_code == 303
+    detail_response = client.get(applied.headers["location"])
+    targets_response = client.get("/targets")
+    dashboard_response = client.get("/")
+    targets_again_response = client.get("/targets")
+    detail_again_response = client.get(f"/targets/{target_id}")
+    dashboard_again_response = client.get("/")
+    run_state_response = client.get(f"/targets/{target_id}/run/state")
+    detail, targets, dashboard = detail_response.text, targets_response.text, dashboard_response.text
+    result_block = targets.split(f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    dashboard_row = re.search(rf'<tr><td><a href="/targets/{target_id}">app\.myob\.com</a>(.*?)</tr>',
+                              dashboard, re.S).group(1)
+
+    assert "DNS rewrite updated: 108.157.32.2 -&gt; 108.157.32.71" in detail
+    assert 'class="ip-copy-value">108.157.32.71' in detail
+    assert 'class="ip-copy-value">108.157.32.71' in result_block
+    assert 'class="ip-copy-value">108.157.32.71' in result_block
+    assert f'action="/targets/{target_id}/apply-best"' not in result_block
+    current_inline = result_block.split("Current IP:</span>", 1)[1].split("</strong>", 1)[0]
+    best_inline = result_block.split("Best IP:</span>", 1)[1].split("</strong>", 1)[0]
+    assert "108.157.32.71" in current_inline and "108.157.32.71" in best_inline
+    assert "108.157.32.71" in dashboard_row
+    assert "108.157.32.2" not in current_inline and "108.157.32.2" not in dashboard_row
+    assert fake.writes == [("app.myob.com", "108.157.32.2", "app.myob.com", "108.157.32.71")]
+    for response in (targets_response, dashboard_response, targets_again_response,
+                     detail_again_response, dashboard_again_response, run_state_response):
+        assert "no-store" in response.headers["cache-control"]
+        assert response.headers["pragma"] == "no-cache"
+    assert 'hx-history="false"' in detail_again_response.text
+    state_current = run_state_response.text.split("Current IP:</span>", 1)[1].split("</strong>", 1)[0]
+    assert "108.157.32.71" in state_current and "108.157.32.2" not in state_current
+    assert '>Apply Best IP</button>' not in run_state_response.text
+    for response in (targets_again_response, dashboard_again_response, detail_again_response):
+        assert '>Apply Best IP</button>' not in response.text
+        assert "108.157.32.71" in response.text
+    second_target_result = targets_again_response.text.split(
+        f'id="run-result-{target_id}"', 1)[1].split("</td>", 1)[0]
+    second_target_current = second_target_result.split("Current IP:</span>", 1)[1].split("</strong>", 1)[0]
+    detail_current = detail_again_response.text.split("<span>Current rewrite</span>", 1)[1].split("</article>", 1)[0]
+    assert "108.157.32.71" in second_target_current and "108.157.32.2" not in second_target_current
+    assert "108.157.32.71" in detail_current and "108.157.32.2" not in detail_current
+    assert fake.list_calls == 9  # one AdGuard rewrite-list fetch per dynamic page request
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == fake.current == "108.157.32.71"
+
+
+def test_authoritative_rewrite_map_batches_and_normalizes_all_requested_hosts(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    with database.session() as session:
+        first = save_target(session, Target(hostname="One.Example."))
+        second = save_target(session, Target(hostname="two.example"))
+
+    class RewriteList:
+        calls = 0
+        def list_rewrites(self):
+            self.calls += 1
+            return [{"domain": "ONE.EXAMPLE", "answer": "108.157.32.71"},
+                    {"domain": "two.example.", "answer": "192.0.2.8"}]
+        def close(self): pass
+
+    fake = RewriteList()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    result = web_routes._authoritative_rewrite_map([first, second])
+    assert result == {"one.example": ("108.157.32.71", True),
+                      "two.example": ("192.0.2.8", True)}
+    assert fake.calls == 1
+
+
+def test_true_external_rewrite_change_after_route_read_conflicts_and_syncs(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="conflict.example"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="192.0.2.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "192.0.2.1", "current_rewrite_lookup_succeeded": True},
+            DecisionResult(action="UPDATE", candidate_ip="192.0.2.2", reason="Healthy best"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="192.0.2.1"))
+        session.commit()
+
+    class ChangedAdGuard:
+        current = "192.0.2.3"
+        writes = 0
+        def get_rewrite(self, _hostname): return {"domain": "conflict.example", "answer": self.current}
+        def update_rewrite(self, *_args): self.writes += 1
+        def add_rewrite(self, *_args): self.writes += 1
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = ChangedAdGuard()
+    reads = iter([("192.0.2.1", True)])
+    def route_read(_hostname):
+        return next(reads, (fake.current, True))
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", route_read)
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].endswith("?rewrite=conflict&verified_ip=192.0.2.3")
+    assert fake.writes == 0
+    page = client.get(response.headers["location"]).text
+    assert "DNS rewrite changed externally; refreshed current state." in page
+    assert 'class="ip-copy-value">192.0.2.3' in page
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.3"
+        assert not session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+
+
+def test_race_to_selected_best_before_service_compare_is_idempotent(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.core import rewrites
+    from app.db.models import OptimizerStateRecord
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="concurrent-apply.example"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="192.0.2.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"resolution_failed": False},
+            DecisionResult(action="UPDATE", candidate_ip="192.0.2.2", reason="Healthy best"))
+        target_id, run_id = target.id, run.id
+        session.add(OptimizerStateRecord(target_id=target_id, current_rewrite_ip="192.0.2.1"))
+        session.commit()
+
+    class AlreadyChangedAdGuard:
+        current = "192.0.2.2"
+        writes = 0
+        def get_rewrite(self, hostname): return {"domain": hostname, "answer": self.current}
+        def update_rewrite(self, *_args): self.writes += 1
+        def add_rewrite(self, *_args): self.writes += 1
+        def delete_rewrite(self, *_args): self.current = None
+        def close(self): pass
+
+    fake = AlreadyChangedAdGuard()
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    monkeypatch.setattr(rewrites, "_adguard_client", lambda: fake)
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+    }, follow_redirects=False)
+    assert response.headers["location"].endswith("?rewrite=already-applied&ip=192.0.2.2")
+    assert fake.writes == 0
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.2"
+        assert not session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+
+
+def test_apply_submit_disables_button_and_prevents_double_submit():
+    from pathlib import Path
+    base = (Path(__file__).parents[1] / "app/web/templates/base.html").read_text(encoding="utf-8")
+    script = (Path(__file__).parents[1] / "app/web/static/apply.js").read_text(encoding="utf-8")
+    assert '<script src="/static/apply.js" defer></script>' in base
+    assert 'form.matches(".apply-best-form")' in script
+    assert 'form.dataset.applying === "true"' in script
+    assert "event.preventDefault()" in script
+    assert "button.disabled = true" in script
+    assert 'button.setAttribute("aria-busy", "true")' in script
+    assert "Applying..." in script
+
+
 def test_inline_and_standalone_share_apply_button_template(web):
     template_dir = Path(__file__).resolve().parents[1] / "app" / "web" / "templates"
     partial = (template_dir / "benchmark_result.html").read_text(encoding="utf-8")
@@ -549,6 +1267,86 @@ def test_inline_and_standalone_share_apply_button_template(web):
         assert '{% include "benchmark_result.html" %}' in source
         assert "Apply Best IP" not in source
     assert partial.count("Apply Best IP") == 1
+
+
+def test_apply_button_forms_are_native_post_forms_in_inline_and_detail_paths(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from html.parser import HTMLParser
+
+    with database.session() as session:
+        target = save_target(session, Target(hostname="form-owner.example"))
+        run = save_benchmark_run(session, target.id, [
+            BenchmarkResult(ip="192.0.2.1", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=20, median_ms=20, min_ms=18, max_ms=22, jitter_ms=2),
+            BenchmarkResult(ip="192.0.2.2", healthy=True, valid_runs=10, requested_runs=10,
+                            average_ms=10, median_ms=10, min_ms=9, max_ms=11, jitter_ms=1),
+        ], {"current_rewrite_ip": "192.0.2.1", "current_rewrite_lookup_succeeded": True},
+            DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip="192.0.2.2",
+                           reason="Candidate is faster"))
+        target_id, run_id = target.id, run.id
+    live_rewrite = {"ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: (live_rewrite["ip"], True))
+    calls = []
+
+    def applied(session, target, new_ip, _reason, _run_id, **_kwargs):
+        from app.db.models import OptimizerStateRecord
+        calls.append((target.hostname, new_ip))
+        state = session.get(OptimizerStateRecord, target.id)
+        if state is None:
+            state = OptimizerStateRecord(target_id=target.id)
+            session.add(state)
+        state.current_rewrite_ip = new_ip
+        session.commit()
+        return {"healthy": True, "changed": True, "verified_current_ip": new_ip}
+
+    monkeypatch.setattr(web_routes, "set_rewrite", applied)
+
+    class FormOwnerParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.forms = []
+            self.apply_owner = None
+            self.apply_button_type = None
+            self.nested_apply = False
+            self.apply_controls = set()
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "form":
+                if self.forms and self.forms[-1].get("id") == f"apply-best-form-{target_id}":
+                    self.nested_apply = True
+                self.forms.append(attrs)
+                if attrs.get("id") == f"apply-best-form-{target_id}":
+                    self.apply_owner = attrs
+            elif tag == "input" and self.forms and self.forms[-1].get("id") == f"apply-best-form-{target_id}":
+                self.apply_controls.add(attrs.get("name"))
+            elif tag == "button" and self.forms and self.forms[-1].get("id") == f"apply-best-form-{target_id}":
+                self.apply_button_type = attrs.get("type")
+
+        def handle_endtag(self, tag):
+            if tag == "form" and self.forms:
+                self.forms.pop()
+
+    rendered_pages = (client.get("/targets"), client.get(f"/targets/{target_id}"))
+    for page in rendered_pages:
+        assert page.status_code == 200
+        parser = FormOwnerParser()
+        parser.feed(page.text)
+        assert parser.apply_owner is not None
+        assert parser.apply_owner.get("method", "get").lower() == "post"
+        assert parser.apply_owner.get("action") == f"/targets/{target_id}/apply-best"
+        assert parser.apply_owner.get("hx-boost") == "false"
+        assert {"csrf_token", "run_id", "old_ip", "new_ip", "confirm"} <= parser.apply_controls
+        assert parser.apply_button_type == "submit"
+        assert parser.nested_apply is False
+        response = client.post(parser.apply_owner["action"], data={
+            "csrf_token": client.headers["x-csrf-token"], "run_id": run_id,
+            "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+        }, follow_redirects=False)
+        assert response.status_code == 303
+    assert calls == [("form-owner.example", "192.0.2.2")] * 2
 
 
 def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web, monkeypatch):
@@ -566,11 +1364,14 @@ def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web,
             DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip="192.0.2.2",
                            reason="Candidate is faster"))
         target_id, run_id = target.id, run.id
-    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    live_rewrite = {"ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: (live_rewrite["ip"], True))
     calls = []
     def apply_verified(session, target, ip, reason, selected_run, **kwargs):
         from app.db.models import OptimizerStateRecord
         calls.append((ip, reason, selected_run, kwargs.get("expected_old_ip")))
+        live_rewrite["ip"] = ip
         state = session.get(OptimizerStateRecord, target.id)
         if state is None:
             state = OptimizerStateRecord(target_id=target.id)
@@ -583,23 +1384,238 @@ def test_apply_best_requires_confirmation_and_uses_existing_rewrite_service(web,
     form = {"run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true"}
     assert client.post(f"/targets/{target_id}/apply-best", data={**form, "confirm": "false"}).status_code == 400
     response = client.post(f"/targets/{target_id}/apply-best", data=form, follow_redirects=False)
-    assert response.status_code == 303 and response.headers["location"].endswith("?rewrite=applied")
+    assert response.status_code == 303 and response.headers["location"].endswith(
+        "?rewrite=applied&old_ip=192.0.2.1&new_ip=192.0.2.2")
     assert calls == [("192.0.2.2", "Manual Apply Best IP", run_id, "192.0.2.1")]
     refreshed = client.get(response.headers["location"])
-    assert "Best IP applied and verified by AdGuard" in refreshed.text
+    assert "DNS rewrite updated: 192.0.2.1 -&gt; 192.0.2.2" in refreshed.text
     assert 'data-copy="192.0.2.2"' in refreshed.text
     with database.session() as session:
         from app.db.models import OptimizerStateRecord
         assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.2"
 
-    monkeypatch.setattr(web_routes, "set_rewrite", lambda *_args, **_kwargs:
-                        {"healthy": False, "rolled_back": True,
-                         "verified_current_ip": "192.0.2.1"})
+    def rollback_verified(*_args, **_kwargs):
+        live_rewrite["ip"] = "192.0.2.1"
+        return {"healthy": False, "rolled_back": True, "verified_current_ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "set_rewrite", rollback_verified)
+    live_rewrite["ip"] = "192.0.2.1"
     failed = client.post(f"/targets/{target_id}/apply-best", data=form, follow_redirects=False)
-    assert failed.status_code == 303 and failed.headers["location"].endswith("?rewrite=rolled-back")
+    assert failed.status_code == 303 and failed.headers["location"].endswith(
+        "?rewrite=rolled-back&verified_ip=192.0.2.1")
     failed_page = client.get(failed.headers["location"])
-    assert "AdGuard verified the restored rewrite" in failed_page.text
+    assert "New IP failed health check; rolled back to 192.0.2.1" in failed_page.text
     assert 'data-copy="192.0.2.1"' in failed_page.text
+
+
+def test_apply_best_csrf_is_enforced(web):
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="apply-csrf.example"))
+        run = save_benchmark_run(session, target.id, [], {})
+        target_id, run_id = target.id, run.id
+    csrf = client.headers.pop("x-csrf-token")
+    response = client.post(f"/targets/{target_id}/apply-best", data={
+        "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
+    })
+    assert response.status_code == 403
+    client.headers["x-csrf-token"] = csrf
+
+
+def _seed_add_dns_target(database, hostname="add-dns.example", healthy=True):
+    from datetime import datetime, timezone
+    with database.session() as session:
+        target = save_target(session, Target(hostname=hostname))
+        result = BenchmarkResult(ip="192.0.2.44", healthy=healthy, valid_runs=10 if healthy else 0,
+                                requested_runs=10, average_ms=10 if healthy else None,
+                                median_ms=10 if healthy else None, min_ms=9 if healthy else None,
+                                max_ms=11 if healthy else None, jitter_ms=1 if healthy else None)
+        run = save_benchmark_run(session, target.id, [result], {
+            "current_rewrite_ip": None, "current_rewrite_lookup_succeeded": True,
+            "resolution_failed": False,
+        }, DecisionResult(action="KEEP", reason="test"))
+        target_id, run_id = target.id, run.id
+    return target_id, run_id
+
+
+def test_add_to_dns_button_requires_absent_live_rewrite_and_healthy_best(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    target_id, _ = _seed_add_dns_target(database)
+    live = {"ip": None}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (live["ip"], True))
+    assert "Add to DNS" in client.get(f"/targets/{target_id}").text
+    live["ip"] = "192.0.2.44"
+    assert "Add to DNS" not in client.get(f"/targets/{target_id}").text
+
+
+@pytest.mark.parametrize("path_kind", ["inline", "detail"])
+def test_add_to_dns_unavailable_current_best_healthy_is_visible_in_both_paths(web, monkeypatch, path_kind):
+    client, database = web
+    import app.web.routes as web_routes
+    target_id, run_id = _seed_add_dns_target(database)
+    with database.session() as session:
+        run = session.get(BenchmarkRunRecord, run_id)
+        run.summary["resolution_failed"] = True
+        run.summary["current_rewrite_lookup_succeeded"] = False
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
+    page = client.get("/targets").text if path_kind == "inline" else client.get(f"/targets/{target_id}").text
+    assert "Unavailable" in page
+    title_group = page.split('class="benchmark-result-top"', 1)[1].split('class="benchmark-result-ip"', 1)[0]
+    assert title_group.index('class="benchmark-hostname"') < title_group.index('class="add-to-dns-form"')
+    assert title_group.index('class="add-to-dns-form"') < title_group.index(">Add to DNS</button>")
+
+
+def test_existing_rewrite_hides_add_and_synchronizes_from_targets_inline(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    target_id, _ = _seed_add_dns_target(database)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: ("192.0.2.88", True))
+    page = client.get("/targets").text
+    assert ">Add to DNS</button>" not in page
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.88"
+
+
+@pytest.mark.parametrize("healthy,stale", [(False, False), (True, True)])
+def test_add_to_dns_eligibility_hides_unhealthy_or_stale_in_both_pages(web, monkeypatch, healthy, stale):
+    client, database = web
+    import app.web.routes as web_routes
+    from datetime import timedelta
+    from app.db.models import BenchmarkRunRecord, utc_now
+    target_id, run_id = _seed_add_dns_target(database, healthy=healthy)
+    if stale:
+        with database.session() as session:
+            session.get(BenchmarkRunRecord, run_id).completed_at = utc_now() - timedelta(hours=2)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
+    for page in (client.get("/targets").text, client.get(f"/targets/{target_id}").text):
+        assert ">Add to DNS</button>" not in page
+
+
+def test_add_to_dns_creates_verifies_and_persists_once(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    target_id, run_id = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        existing = None
+        adds = 0
+        def get_rewrite(self, hostname):
+            return self.existing
+        def add_rewrite(self, hostname, ip):
+            self.adds += 1
+            self.existing = {"domain": hostname, "answer": ip}
+        def close(self): pass
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: (fake.existing["answer"] if fake.existing else None, True))
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"].endswith("?rewrite=added")
+    assert fake.adds == 1
+    page = client.get(response.headers["location"])
+    assert "DNS rewrite added and verified" in page.text
+    assert 'data-copy="192.0.2.44"' in page.text
+    assert ">Add to DNS</button>" not in page.text
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.44"
+        history = session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+        assert len(history) == 1 and history[0].old_ip is None and history[0].new_ip == "192.0.2.44"
+        assert session.scalar(select(AuditLogRecord).where(
+            AuditLogRecord.event == "rewrite_added", AuditLogRecord.target_id == target_id)) is not None
+
+
+def test_add_to_dns_duplicate_syncs_existing_ip_without_add(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    target_id, run_id = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        adds = 0
+        def get_rewrite(self, _hostname): return {"domain": "add-dns.example", "answer": "192.0.2.55"}
+        def add_rewrite(self, *_args): self.adds += 1
+        def close(self): pass
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite",
+                        lambda _hostname: ("192.0.2.55", True))
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: pytest.fail("duplicate must not create"))
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.headers["location"].endswith("?rewrite=already-exists") and fake.adds == 0
+    assert "Domain already exists in AdGuard. DRO state was synchronized." in client.get(response.headers["location"]).text
+    with database.session() as session:
+        assert session.get(OptimizerStateRecord, target_id).current_rewrite_ip == "192.0.2.55"
+        assert not session.scalars(select(RewriteHistoryRecord).where(
+            RewriteHistoryRecord.target_id == target_id)).all()
+
+
+@pytest.mark.parametrize("healthy,stale", [(False, False), (True, True)])
+def test_add_to_dns_blocks_unhealthy_or_stale_best(web, monkeypatch, healthy, stale):
+    client, database = web
+    import app.web.routes as web_routes
+    from datetime import timedelta
+    from app.db.models import BenchmarkRunRecord, utc_now
+    target_id, run_id = _seed_add_dns_target(database, healthy=healthy)
+    if stale:
+        with database.session() as session:
+            run = session.get(BenchmarkRunRecord, run_id)
+            run.completed_at = utc_now() - timedelta(hours=2)
+    class FakeAdGuard:
+        adds = 0
+        def get_rewrite(self, _hostname): return None
+        def add_rewrite(self, *_args): self.adds += 1
+        def close(self): pass
+    fake = FakeAdGuard()
+    monkeypatch.setattr(web_routes, "configured_adguard_client", lambda: fake)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.status_code == 409 and fake.adds == 0
+
+
+def test_add_to_dns_failure_does_not_persist_current_ip(web, monkeypatch):
+    client, database = web
+    import app.web.routes as web_routes
+    from app.db.models import OptimizerStateRecord
+    from app.integrations.adguard import AdGuardError
+    target_id, run_id = _seed_add_dns_target(database)
+    class FakeAdGuard:
+        def get_rewrite(self, _hostname): return None
+        def add_rewrite(self, *_args): raise AdGuardError("failed")
+        def close(self): pass
+    monkeypatch.setattr(web_routes, "configured_adguard_client", FakeAdGuard)
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (None, True))
+    monkeypatch.setattr(web_routes, "_healthy", lambda *_args: True)
+    response = client.post(f"/targets/{target_id}/add-to-dns",
+                           data={"run_id": run_id, "confirm": "true"}, follow_redirects=False)
+    assert response.headers["location"].endswith("?rewrite=add-failed")
+    assert "No success was recorded" in client.get(response.headers["location"]).text
+    with database.session() as session:
+        state = session.get(OptimizerStateRecord, target_id)
+        assert state is None or state.current_rewrite_ip is None
+        assert session.scalar(select(AuditLogRecord).where(
+            AuditLogRecord.event == "rewrite_add_failed", AuditLogRecord.target_id == target_id)) is not None
+
+
+def test_add_to_dns_requires_auth_csrf_and_explicit_confirmation(web):
+    client, database = web
+    target_id, run_id = _seed_add_dns_target(database)
+    csrf = client.headers["x-csrf-token"]
+    client.headers.pop("x-csrf-token")
+    assert client.post(f"/targets/{target_id}/add-to-dns",
+                       data={"run_id": run_id, "confirm": "true"}).status_code == 403
+    client.headers["x-csrf-token"] = "invalid"
+    assert client.post(f"/targets/{target_id}/add-to-dns",
+                       data={"run_id": run_id, "confirm": "true"}).status_code == 403
+    client.headers["x-csrf-token"] = csrf
+    assert client.post(f"/targets/{target_id}/add-to-dns",
+                       data={"run_id": run_id, "confirm": "false"}).status_code == 400
 
 
 def test_apply_uses_verified_readback_instead_of_requested_ip(web, monkeypatch):
@@ -617,12 +1633,17 @@ def test_apply_uses_verified_readback_instead_of_requested_ip(web, monkeypatch):
             DecisionResult(action="UPDATE", current_ip="192.0.2.1", candidate_ip="192.0.2.2",
                            reason="Candidate is faster"))
         target_id, run_id = target.id, run.id
-    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: ("192.0.2.1", True))
+    live = {"ip": "192.0.2.1"}
+    monkeypatch.setattr(web_routes, "read_adguard_rewrite", lambda _hostname: (live["ip"], True))
 
     def failed_with_verified_current(session, _target, *_args, **_kwargs):
         from app.db.models import OptimizerStateRecord
-        state = OptimizerStateRecord(target_id=target_id, current_rewrite_ip="192.0.2.9")
-        session.add(state)
+        state = session.get(OptimizerStateRecord, target_id)
+        if state is None:
+            state = OptimizerStateRecord(target_id=target_id)
+            session.add(state)
+        state.current_rewrite_ip = "192.0.2.9"
+        live["ip"] = "192.0.2.9"
         session.commit()
         return {"healthy": False, "rolled_back": False,
                 "verified_current_ip": "192.0.2.9"}
@@ -632,7 +1653,7 @@ def test_apply_uses_verified_readback_instead_of_requested_ip(web, monkeypatch):
         "run_id": run_id, "old_ip": "192.0.2.1", "new_ip": "192.0.2.2", "confirm": "true",
     }, follow_redirects=False)
     page = client.get(response.headers["location"])
-    assert "Apply did not complete successfully" in page.text
+    assert "DNS rewrite update failed: AdGuard readback did not match the requested IP" in page.text
     assert 'data-copy="192.0.2.9"' in page.text
     current_row = page.text.split('<span>Current IP:</span>', 1)[1].split('</div>', 1)[0]
     assert 'data-copy="192.0.2.9"' in current_row
@@ -917,7 +1938,7 @@ def test_dashboard_rows_and_latest_run_map_query_count(tmp_path):
         assert len(latest_map) == 2
         assert t1_id in latest_map and t2_id in latest_map and t3_id not in latest_map
 
-        t1_run, t1_best = latest_map[t1_id]
+        t1_run, t1_best = latest_map[t1_id][:2]
         assert t1_best.average_ms == 14.0
 
         queries = []
@@ -932,3 +1953,86 @@ def test_dashboard_rows_and_latest_run_map_query_count(tmp_path):
         finally:
             event.remove(db.engine, "before_cursor_execute", receive_before_cursor_execute)
     db.close()
+
+
+def test_dashboard_diagnostics_post_is_read_only_and_formats_vntime(web, monkeypatch):
+    import app.core.system_diagnostics as diagnostics
+    import app.web.routes as web_routes
+    from datetime import datetime, timezone
+    from app.db.models import (BenchmarkRunRecord, OptimizerStateRecord, ScheduleStateRecord,
+                               SettingRecord)
+
+    client, database = web
+    with database.session() as session:
+        target = save_target(session, Target(hostname="diagnostic.example"))
+        run = save_benchmark_run(session, target.id, [], {}, DecisionResult(action="KEEP", reason="no change"))
+        next_run = datetime(2026, 10, 7, 1, 0, tzinfo=timezone.utc)
+        state = OptimizerStateRecord(target_id=target.id, current_rewrite_ip="192.0.2.44",
+                                     pending_candidate_ip="192.0.2.45", consecutive_wins=2)
+        schedule = ScheduleStateRecord(target_id=target.id, next_run_at=next_run)
+        session.add_all([state, schedule, SettingRecord(key="scheduler_enabled", value="true")])
+        session.commit()
+        target_id, run_id = target.id, run.id
+
+    class ReadOnlyAdGuard:
+        def list_rewrites(self):
+            return [{"domain": "diagnostic.example", "answer": "192.0.2.44"}]
+        def close(self): pass
+
+    monkeypatch.setattr(web_routes, "configured_adguard_client", ReadOnlyAdGuard)
+    monkeypatch.setattr(diagnostics, "_resolve", lambda *_args: ["192.0.2.44"])
+    monkeypatch.setattr(diagnostics, "_connect", lambda *_args: True)
+    monkeypatch.setattr(diagnostics, "_connect_https", lambda *_args: True)
+
+    rejected = client.post("/diagnostics/run", headers={"x-csrf-token": "invalid"})
+    assert rejected.status_code == 403
+    response = client.post("/diagnostics/run", headers={
+        "x-csrf-token": client.headers["x-csrf-token"], "x-forwarded-proto": "https",
+    })
+    assert response.status_code == 200
+    assert "System Diagnostics" in response.text
+    assert "Overall: Healthy" in response.text
+    assert "AdGuard Rewrite Read" in response.text and "1 rewrite readable" in response.text
+    assert "Enabled target checks (1/1 healthy)" in response.text
+    assert "diagnostic.example" in response.text
+    assert re.search(r"Last run: <time>\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2} VNTime</time>", response.text)
+    assert "ui-secret" not in response.text and "ADGUARD_PASS" not in response.text
+    assert response.headers["cache-control"].startswith("private, no-store")
+
+    with database.session() as session:
+        current_state = session.get(OptimizerStateRecord, target_id)
+        current_schedule = session.get(ScheduleStateRecord, target_id)
+        assert (current_state.current_rewrite_ip, current_state.pending_candidate_ip,
+                current_state.consecutive_wins) == ("192.0.2.44", "192.0.2.45", 2)
+        assert current_schedule.next_run_at == next_run.replace(tzinfo=None)
+        assert session.get(BenchmarkRunRecord, run_id) is not None
+        assert session.query(BenchmarkRunRecord).count() == 1
+        assert session.query(RewriteHistoryRecord).count() == 0
+        assert session.query(AuditLogRecord).count() == 0
+        assert session.get(SettingRecord, "scheduler_enabled").value == "true"
+
+
+def test_diagnostics_frontend_disables_button_and_posts_once_without_refresh(web):
+    client, _database = web
+    script = client.get("/static/diagnostics.js").text
+    assert 'event.target.closest("#run-diagnostics")' in script
+    assert "if (!button || activeRequest) return" in script
+    assert "button.disabled = true" in script
+    assert 'method: "POST"' in script
+    assert '"X-CSRF-Token": button.dataset.csrf' in script
+    assert "location.reload" not in script and 'window.location' not in script
+    assert "result.innerHTML = await response.text()" in script
+    css = client.get("/static/style.css").text
+    assert ".diagnostics-healthy{color:var(--good)}" in css
+    assert ".diagnostics-warning{color:#f1c978}" in css
+    assert ".diagnostics-failed{color:var(--danger)}" in css
+    assert "@media(max-width:650px)" in css and ".diagnostics-table{min-width:540px}" in css
+
+
+def test_diagnostics_route_requires_authenticated_admin(web):
+    client, _database = web
+    client.cookies.clear()
+    response = client.post("/diagnostics/run", headers={"x-csrf-token": "irrelevant"},
+                           follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"

@@ -59,6 +59,50 @@ def test_statistics_and_health_threshold():
     assert not calculate_statistics(samples[:7] + [BenchmarkSample(ip="1.2.3.4", run_number=8)] * 3, 10).healthy
 
 
+@pytest.mark.parametrize(("stderr", "expected"), [
+    ("curl: (28) Failed to connect: Operation timed out", "connect timeout"),
+    ("curl: (28) Operation timed out while reading response", "read timeout"),
+    ("curl: (7) Failed to connect: Connection refused", "connection refused"),
+    ("curl: (56) Recv failure: Connection reset by peer", "connection reset"),
+    ("curl: (60) SSL certificate problem: unable to get local issuer certificate", "TLS certificate verification failure"),
+    ("curl: (60) SSL: no alternative certificate subject name matches", "hostname/SNI mismatch"),
+    ("curl: (6) Could not resolve host", "DNS/resolve issue"),
+    ("curl: (47) Maximum redirects followed", "redirect failure"),
+    ("curl: (99) unexpected client error", "other HTTP/client error"),
+])
+def test_benchmark_candidate_failure_reason_is_classified(stderr, expected):
+    result = calculate_statistics([BenchmarkSample(ip="203.0.113.20", run_number=1, error=stderr)], 1)
+    assert not result.healthy and result.health_reason == f"1x {expected}"
+
+
+def test_benchmark_http_status_failure_keeps_actual_status_and_accepted_range():
+    sample = BenchmarkSample(ip="203.0.113.20", run_number=1, http_status=403,
+                             connect_ms=1, tls_ms=2, total_ms=3, error="HTTP 403 outside accepted range 200-399")
+    result = calculate_statistics([sample], 1)
+    assert sample.http_status == 403 and not sample.valid
+    assert result.health_reason == "1x HTTP 403"
+
+
+def test_benchmark_runner_logs_candidate_and_sample_diagnostic(caplog):
+    response = subprocess.CompletedProcess([], 0,
+        stdout="403\t0.01\t0.03\t0.05", stderr="")
+    runner = benchmark_module.HttpsBenchmarkRunner(1, command_runner=lambda *_args, **_kwargs: response)
+    with caplog.at_level("INFO", logger="app.core.benchmark"):
+        result = runner.benchmark_ip("www.ato.gov.au", "113.171.12.192")
+    assert result.health_reason == "1x HTTP 403"
+    assert "Benchmark finished host=www.ato.gov.au ip=113.171.12.192 valid=0/1 healthy=False" in caplog.text
+    assert "failure_summary=1x HTTP 403" in caplog.text
+    assert "Benchmark sample failed" not in caplog.text
+
+
+def test_benchmark_candidate_failure_reasons_aggregate_identical_samples():
+    samples = [BenchmarkSample(ip="203.0.113.20", run_number=n, http_status=403,
+                               connect_ms=1, tls_ms=2, total_ms=3, error="HTTP 403")
+               for n in range(1, 11)]
+    result = calculate_statistics(samples, 10)
+    assert result.health_reason == "10x HTTP 403"
+
+
 def test_statistics_edge_cases_do_not_require_pstdev_for_zero_or_one_sample(monkeypatch):
     one = BenchmarkSample(ip="1.2.3.4", run_number=1, http_status=200,
                           connect_ms=1, tls_ms=2, total_ms=3)

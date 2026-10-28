@@ -3,14 +3,16 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}DRO{% endblock %} · DNS Route Optimizer</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=system-diagnostics-1">
   <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+  <script src="/static/apply.js" defer></script>
+  <script src="/static/diagnostics.js" defer></script>
 </head>
-<body hx-boost="true">
-  <header class="topbar"><a class="brand" href="/">DRO</a><nav>
+<body hx-boost="true" hx-history="false">
+  <header class="topbar"><a class="brand" href="/">DRO <span class="brand-version">{{ version }}</span></a><nav>
     <a href="/">Dashboard</a><a href="/targets">Targets</a><a href="/history">History</a>
     <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link" type="submit">Log out</button></form>
   </nav></header>
-  <main>{% block content %}{% endblock %}<footer class="app-version">{{ version }}</footer></main>
+  <main>{% block content %}{% endblock %}</main>
 </body>
 </html>

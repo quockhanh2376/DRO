@@ -23,7 +23,7 @@ def to_vietnam_time(value: datetime) -> datetime:
 def format_vietnam_time(value: datetime | None) -> str:
     if value is None:
         return "—"
-    return to_vietnam_time(value).strftime("%Y-%m-%d %H:%M:%S ICT")
+    return to_vietnam_time(value).strftime("%d-%m-%Y %H:%M:%S VNTime")
 
 
 def next_run_time(completed_at: datetime, interval_hours: float) -> datetime:

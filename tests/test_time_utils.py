@@ -16,7 +16,7 @@ def test_utc_vietnam_conversion_and_naive_sqlite_values():
     assert to_vietnam_time(datetime(2026, 9, 27, 3, 0)) == expected
     assert as_utc_aware(expected) == utc
     assert format_vietnam_time(datetime(2026, 9, 27, 8, 59, 20, tzinfo=timezone.utc)) == (
-        "2026-09-27 15:59:20 ICT")
+        "27-09-2026 15:59:20 VNTime")
 
 
 def test_next_run_uses_vietnam_operational_clock_and_returns_utc():

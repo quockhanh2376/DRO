@@ -2,13 +2,21 @@
   {% if latest %}
   {% set resolution_failed = latest.summary.get('resolution_failed', false) %}
   {% set current_ip = current_ip_override if current_ip_override is defined else latest.summary.get('current_rewrite_ip') %}
-  {% set can_apply = not resolution_failed and latest.summary.get('current_rewrite_lookup_succeeded') and current_ip and best and best.healthy and current_ip != best.ip %}
+  {% set current_lookup_succeeded = current_rewrite_lookup_succeeded_override if current_rewrite_lookup_succeeded_override is defined else latest.summary.get('current_rewrite_lookup_succeeded') %}
+  {% set can_apply = apply_eligible_override|default(false) %}
   <div class="benchmark-result-top">
-    <h2>Benchmark result: <span class="benchmark-hostname">{{ target.hostname }}</span></h2>
-    <div class="benchmark-result-ip"><span>Current IP:</span><strong>{% if resolution_failed %}<span class="unavailable-value">Unavailable</span>{% else %}{% set ip_value = current_ip %}{% include "ip_copy.html" %}{% endif %}</strong></div>
+    <h2>Benchmark result: <span class="benchmark-hostname">{{ target.hostname }}</span>{% if can_add_to_dns|default(false) %}
+      <form method="post" action="/targets/{{ target.id }}/add-to-dns" class="add-to-dns-form" data-confirm="Add {{ target.hostname }} -> {{ best.ip }} to AdGuard DNS Rewrite?" onsubmit="return confirm(this.dataset.confirm)">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="run_id" value="{{ latest.id }}">
+        <input type="hidden" name="confirm" value="true">
+        <button class="button primary" type="submit">Add to DNS</button>
+      </form>
+    {% endif %}</h2>
+    <div class="benchmark-result-ip"><span>Current IP:</span><strong>{% if not current_lookup_succeeded %}<span class="unavailable-value">Unavailable</span><small class="current-ip-reason">AdGuard read failed</small>{% else %}{% set ip_value = current_ip %}{% include "ip_copy.html" %}{% endif %}</strong></div>
     <div class="benchmark-result-ip"><span>Best IP:</span><strong class="best-ip">{% if resolution_failed %}<span class="unavailable-value">Unavailable</span>{% else %}{% set ip_value = best.ip if best else None %}{% include "ip_copy.html" %}{% endif %}</strong></div>
     <div class="benchmark-result-apply">{% if can_apply %}
-      <form method="post" action="/targets/{{ target.id }}/apply-best" class="apply-best-form" data-confirm="Apply best IP? This will change the AdGuard rewrite from {{ current_ip }} to {{ best.ip }}." onsubmit="return confirm(this.dataset.confirm)">
+      <form id="apply-best-form-{{ target.id }}" method="post" action="/targets/{{ target.id }}/apply-best" class="apply-best-form" hx-boost="false" data-confirm="Apply best IP? This will change the AdGuard rewrite from {{ current_ip }} to {{ best.ip }}." onsubmit="return confirm(this.dataset.confirm)">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="run_id" value="{{ latest.id }}">
         <input type="hidden" name="old_ip" value="{{ current_ip }}">
@@ -19,6 +27,7 @@
     {% endif %}</div>
   </div>
   {% if resolution_failed %}<div class="resolution-warning" role="alert">Unable to resolve this domain. Please double-check the hostname and try again.</div>{% endif %}
+  {% if not best and latest.summary.get('failure_summary') %}<p class="benchmark-no-healthy">No healthy candidate: {{ latest.summary.get('failure_summary') }}.</p>{% endif %}
   <div class="benchmark-result-details">
     <div class="benchmark-candidates">
       <h3>Discovered candidates</h3>
@@ -30,7 +39,7 @@
     </div>
   </div>
   <div class="table-wrap"><table><thead><tr><th>IP</th><th>Avg</th><th>Median</th><th>Min</th><th>Max</th><th>Jitter</th></tr></thead><tbody>
-  {% for result in latest.results %}<tr{% if best and result.ip == best.ip %} class="best-candidate"{% endif %}><td>{% set ip_value = result.ip %}{% include "ip_copy.html" %}{% if best and result.ip == best.ip %} <span class="badge">Best</span>{% endif %}</td><td>{{ result.average_ms if result.average_ms is not none else "—" }}</td><td>{{ result.median_ms if result.median_ms is not none else "—" }}</td><td>{{ result.min_ms if result.min_ms is not none else "—" }}</td><td>{{ result.max_ms if result.max_ms is not none else "—" }}</td><td>{{ result.jitter_ms if result.jitter_ms is not none else "—" }}</td></tr>{% else %}<tr><td colspan="6" class="empty">No benchmark results.</td></tr>{% endfor %}
+  {% for result in latest.results %}<tr{% if best and result.ip == best.ip %} class="best-candidate"{% endif %}><td>{% set ip_value = result.ip %}{% include "ip_copy.html" %}{% if best and result.ip == best.ip %} <span class="badge">Best</span>{% endif %}{% set health_reason = latest.summary.get('candidate_health_reasons', {}).get(result.ip) %}{% if health_reason %}<div class="benchmark-health-reason">{{ health_reason }}</div>{% endif %}</td><td>{{ result.average_ms if result.average_ms is not none else "—" }}</td><td>{{ result.median_ms if result.median_ms is not none else "—" }}</td><td>{{ result.min_ms if result.min_ms is not none else "—" }}</td><td>{{ result.max_ms if result.max_ms is not none else "—" }}</td><td>{{ result.jitter_ms if result.jitter_ms is not none else "—" }}</td></tr>{% else %}<tr><td colspan="6" class="empty">No benchmark results.</td></tr>{% endfor %}
   </tbody></table></div>
   {% else %}<h2>Benchmark result: {{ target.hostname }}</h2><p class="empty">The run finished without a saved benchmark result.</p>{% endif %}
 </section>

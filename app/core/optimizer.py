@@ -13,7 +13,7 @@ from app.core.decision import DecisionEngine
 from app.core.discovery import DiscoveryError, PublicDnsDiscovery
 from app.db.models import TargetRecord
 from app.db.repositories import (
-    add_audit_event, get_current_rewrite_ip, get_pending_state, save_benchmark_run,
+    add_audit_event, get_pending_state, save_benchmark_run,
     save_optimizer_state,
 )
 from app.integrations.adguard import AdGuardError, configured_adguard_client
@@ -21,6 +21,13 @@ from app.models.benchmark import DecisionResult, PendingCandidateState
 from app.models.target import Target
 
 logger = logging.getLogger(__name__)
+
+
+def _failure_summary(results) -> str | None:
+    failures = [result.health_reason for result in results if not result.healthy and result.health_reason]
+    if not failures:
+        return None
+    return "; ".join(failures)
 
 
 def read_adguard_rewrite(hostname: str) -> tuple[str | None, bool]:
@@ -60,7 +67,6 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
     """Benchmark a target, persist its results/state, and return a secret-free summary."""
     config = Target.model_validate(record, from_attributes=True)
     pending = get_pending_state(session, record.id)
-    stored_current_ip = get_current_rewrite_ip(session, record.id)
     discovery = PublicDnsDiscovery()
     discovery_error = None
     try:
@@ -75,8 +81,12 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
 
     resolved_current_ip, lookup_succeeded = read_adguard_rewrite(config.hostname)
     if not lookup_succeeded:
-        resolved_current_ip = stored_current_ip
+        # A cached value is not authoritative. Keep Current Rewrite unavailable until
+        # AdGuard can be read again; discovered public candidates remain separate.
+        resolved_current_ip = None
     resolution_failed = not public_ips
+    logger.info("Benchmark DNS discovery host=%s candidates=%s current_rewrite_ip=%s",
+                config.hostname, public_ips, resolved_current_ip)
     if resolution_failed and not discovery_error:
         logger.warning("Public DNS discovery returned no valid IPv4 records host=%s", config.hostname)
     current_ip = None if resolution_failed else resolved_current_ip
@@ -112,7 +122,10 @@ def run_benchmark_cycle(session: Session, record: TargetRecord) -> dict[str, Any
                "current_rewrite_included": bool(current_ip and current_ip in candidate_ips),
                "current_rewrite_in_public_dns": current_rewrite_in_public_dns,
                "current_rewrite_lookup_succeeded": bool(lookup_succeeded and not resolution_failed),
-               "candidate_count": len(results), "discovery_error": discovery_error}
+               "candidate_count": len(results), "discovery_error": discovery_error,
+               "candidate_health_reasons": {result.ip: result.health_reason for result in results
+                                            if result.health_reason},
+               "failure_summary": _failure_summary(results)}
     with session.begin_nested():
         run = save_benchmark_run(session, record.id, results, summary=summary, decision=decision)
         save_optimizer_state(session, record.id, resolved_current_ip, next_pending, decision)

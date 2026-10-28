@@ -107,3 +107,11 @@
 - Commit and publish the validated release candidate with tag `v1.0.0-rc.1`.
 - Review SSH firewall scope and monitor scheduled benchmark windows and automatic rewrite audit events.
 - Monitor the first scheduled cycles and verify any future rewrite manually from the UI; retain the legacy optimizer until DRO is proven stable.
+
+## 2026-09-29 — Performance audit
+
+- Audited benchmark, DNS discovery, scheduler/queue, logging, and persistence paths; added the reproducible read-only `scripts/performance_audit.py` harness plus a deterministic instrumentation test.
+- Three network repeats: median batch wall was 9.12 s (2 candidates), 18.14 s (4 candidates), and 11.13 s (two targets concurrently, 2 candidates each). All 300 HTTPS samples were valid.
+- Measured top costs: HTTPS/curl sample work (5.77–14.46 s per target); local unavailable-AdGuard lookup (2.50–2.74 s, environment-specific); curl process/wrapper delta estimate 57–75 ms/sample. DoH was 115–158 ms; log handlers, DB transaction, and `summarize()` were negligible.
+- No runtime optimization was justified: concurrency risks benchmark distortion; curl batching/replacement risks TLS/retry/timeout/error semantics; other measured costs were small. No DNS was changed.
+- Validation: full pytest passed (result recorded in the audit report). Production was not accessed or changed.
