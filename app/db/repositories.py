@@ -140,10 +140,16 @@ def add_audit_event(session: Session, event: str, target_id: int | None = None,
     return record
 
 
-def list_benchmark_runs(session: Session, target_id: int) -> list[BenchmarkRunRecord]:
-    return list(session.scalars(select(BenchmarkRunRecord).where(BenchmarkRunRecord.target_id == target_id)
-                                .order_by(BenchmarkRunRecord.completed_at.desc(),
-                                          BenchmarkRunRecord.id.desc())).all())
+def list_benchmark_runs(session: Session, target_id: int, limit: int = 50,
+                        offset: int = 0) -> list[BenchmarkRunRecord]:
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    return list(session.scalars(select(BenchmarkRunRecord).options(
+        selectinload(BenchmarkRunRecord.results)
+    ).where(BenchmarkRunRecord.target_id == target_id)
+        .order_by(BenchmarkRunRecord.completed_at.desc(),
+                  BenchmarkRunRecord.id.desc())
+        .limit(limit).offset(offset)).all())
 
 
 def get_benchmark_run(session: Session, run_id: int) -> BenchmarkRunRecord | None:
@@ -152,9 +158,14 @@ def get_benchmark_run(session: Session, run_id: int) -> BenchmarkRunRecord | Non
     ).where(BenchmarkRunRecord.id == run_id))
 
 
-def list_rewrite_history(session: Session, target_id: int) -> list[RewriteHistoryRecord]:
+def list_rewrite_history(session: Session, target_id: int, limit: int = 50,
+                         offset: int = 0) -> list[RewriteHistoryRecord]:
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
     return list(session.scalars(select(RewriteHistoryRecord).where(RewriteHistoryRecord.target_id == target_id)
-                                .order_by(RewriteHistoryRecord.created_at.desc())).all())
+                                .order_by(RewriteHistoryRecord.created_at.desc(),
+                                          RewriteHistoryRecord.id.desc())
+                                .limit(limit).offset(offset)).all())
 
 
 def count_automatic_rewrites_since(session: Session, since) -> int:

@@ -80,6 +80,13 @@ install -o root -g root -m 0644 "$logrotate_tmp" "/etc/logrotate.d/$LOGROTATE_NA
 chown root:root "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 
+if [[ -f "$ENV_FILE" ]] && ! grep -q '^DRO_SESSION_SECRET=.' "$ENV_FILE"; then
+  generated_secret="$("$PYTHON" -c "import secrets; print(secrets.token_urlsafe(48))" 2>/dev/null || openssl rand -hex 32 2>/dev/null || true)"
+  if [[ -n "$generated_secret" ]]; then
+    echo "DRO_SESSION_SECRET=$generated_secret" >> "$ENV_FILE"
+  fi
+fi
+
 if ! grep -q '^DRO_ADMIN_PASSWORD=.' "$ENV_FILE" || ! grep -q '^DRO_SESSION_SECRET=.' "$ENV_FILE"; then
   echo "Set DRO_ADMIN_USER, DRO_ADMIN_PASSWORD, and DRO_SESSION_SECRET in $ENV_FILE, then rerun this installer."
   exit 1

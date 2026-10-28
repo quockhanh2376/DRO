@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from ipaddress import IPv4Address
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
@@ -67,7 +67,7 @@ def health(session: Session = Depends(get_session)) -> dict:
     return {"status": "ok"}
 
 
-@router.get("/api/v1/system/status")
+@router.get("/api/v1/system/status", dependencies=[Depends(require_admin)])
 def system_status(session: Session = Depends(get_session)) -> dict:
     return {
         "status": "ok",
@@ -154,9 +154,11 @@ def run_target(target_id: int, request: Request, session: Session = Depends(get_
 
 
 @router.get("/api/v1/targets/{target_id}/runs", dependencies=[Depends(require_admin)])
-def list_target_runs(target_id: int, session: Session = Depends(get_session)) -> list[dict]:
+def list_target_runs(target_id: int, limit: int = Query(50, ge=1, le=500),
+                     offset: int = Query(0, ge=0),
+                     session: Session = Depends(get_session)) -> list[dict]:
     get_target_or_404(session, target_id)
-    runs = list_benchmark_runs(session, target_id)
+    runs = list_benchmark_runs(session, target_id, limit=limit, offset=offset)
     return [{"id": run.id, "started_at": run.started_at, "completed_at": run.completed_at,
              "summary": run.summary, "decision_action": run.decision_action,
              "decision_reason": run.decision_reason} for run in runs]
@@ -183,9 +185,11 @@ def get_run(run_id: int, session: Session = Depends(get_session)) -> dict:
 
 
 @router.get("/api/v1/targets/{target_id}/rewrite-history", dependencies=[Depends(require_admin)])
-def rewrite_history(target_id: int, session: Session = Depends(get_session)) -> list[dict]:
+def rewrite_history(target_id: int, limit: int = Query(50, ge=1, le=500),
+                    offset: int = Query(0, ge=0),
+                    session: Session = Depends(get_session)) -> list[dict]:
     get_target_or_404(session, target_id)
-    records = repo_list_rewrite_history(session, target_id)
+    records = repo_list_rewrite_history(session, target_id, limit=limit, offset=offset)
     return [{"id": row.id, "old_ip": row.old_ip, "new_ip": row.new_ip,
              "reason": row.reason, "benchmark_run_id": row.benchmark_run_id,
              "created_at": row.created_at} for row in records]

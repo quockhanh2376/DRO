@@ -8,8 +8,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.routes import (LockRequest, RollbackRequest, get_target_or_404,
                             lock_target as api_lock_target, rollback_target as api_rollback_target,
@@ -64,20 +64,49 @@ def _persist_verified_current_ip(session: Session, target_id: int, current_ip: s
     session.commit()
 
 
+def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, tuple]:
+    if not targets:
+        return {}
+    target_ids = [target.id for target in targets]
+    rn = func.row_number().over(
+        partition_by=BenchmarkRunRecord.target_id,
+        order_by=(BenchmarkRunRecord.completed_at.desc(), BenchmarkRunRecord.id.desc())
+    ).label("rn")
+    subq = (
+        select(BenchmarkRunRecord.id.label("run_id"), rn)
+        .where(BenchmarkRunRecord.target_id.in_(target_ids))
+        .subquery()
+    )
+    latest_run_ids = select(subq.c.run_id).where(subq.c.rn == 1)
+    runs = session.scalars(
+        select(BenchmarkRunRecord)
+        .options(selectinload(BenchmarkRunRecord.results))
+        .where(BenchmarkRunRecord.id.in_(latest_run_ids))
+    ).all()
+    return {run.target_id: (run, _best_benchmark_result(run)) for run in runs}
+
+
 def _dashboard_rows(session: Session) -> list[dict]:
+    targets = list_targets(session)
+    if not targets:
+        return []
+    latest_runs = _latest_run_map(session, targets)
+    target_ids = [target.id for target in targets]
+    states = {state.target_id: state for state in session.scalars(
+        select(OptimizerStateRecord).where(OptimizerStateRecord.target_id.in_(target_ids))
+    ).all()}
+    schedules = {schedule.target_id: schedule for schedule in session.scalars(
+        select(ScheduleStateRecord).where(ScheduleStateRecord.target_id.in_(target_ids))
+    ).all()}
+
     rows = []
-    for target in list_targets(session):
-        run = session.scalar(select(BenchmarkRunRecord).where(
-            BenchmarkRunRecord.target_id == target.id
-        ).order_by(BenchmarkRunRecord.completed_at.desc()).limit(1))
+    for target in targets:
+        run_tuple = latest_runs.get(target.id)
+        run = run_tuple[0] if run_tuple else None
+        best = run_tuple[1] if run_tuple else None
         results = run.results if run else []
-        best = min((result for result in results if result.healthy and result.average_ms is not None),
-                   key=lambda result: (result.average_ms,
-                                       result.median_ms if result.median_ms is not None else float("inf"),
-                                       result.jitter_ms if result.jitter_ms is not None else float("inf")),
-                   default=None)
-        state = session.get(OptimizerStateRecord, target.id)
-        schedule = session.get(ScheduleStateRecord, target.id)
+        state = states.get(target.id)
+        schedule = schedules.get(target.id)
         current = next((item for item in results if state and item.ip == state.current_rewrite_ip), None)
         improvement = None
         if current and best and current.average_ms and best.average_ms is not None:
@@ -92,20 +121,6 @@ def _dashboard_rows(session: Session) -> list[dict]:
                      "status": "Disabled" if not target.enabled else
                      "No benchmark" if not run else "Healthy" if best else "Critical"})
     return rows
-
-
-def _latest_run_map(session: Session, targets: list[TargetRecord]) -> dict[int, tuple]:
-    if not targets:
-        return {}
-    target_ids = [target.id for target in targets]
-    latest_runs = {}
-    runs = session.scalars(select(BenchmarkRunRecord).where(
-        BenchmarkRunRecord.target_id.in_(target_ids)
-    ).order_by(BenchmarkRunRecord.target_id, BenchmarkRunRecord.completed_at.desc(),
-               BenchmarkRunRecord.id.desc())).all()
-    for run in runs:
-        latest_runs.setdefault(run.target_id, (run, _best_benchmark_result(run)))
-    return latest_runs
 
 
 @router.get("/", response_class=HTMLResponse, name="dashboard", dependencies=[Depends(require_admin)])
@@ -128,7 +143,7 @@ def targets_page(request: Request, session: Session = Depends(get_session)):
 def run_state_page(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
     run_status, queue_position = request.app.state.run_coordinator.state(target_id)
-    runs = list_benchmark_runs(session, target_id)
+    runs = list_benchmark_runs(session, target_id, limit=1)
     latest = get_benchmark_run(session, runs[0].id) if runs else None
     return templates.TemplateResponse(request, "run_state.html", _base_context(
         request, target=target, run_status=run_status, queue_position=queue_position,
@@ -139,7 +154,7 @@ def run_state_page(target_id: int, request: Request, session: Session = Depends(
              dependencies=[Depends(protect_mutation)])
 def ping_target_page(target_id: int, request: Request, session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
-    runs = list_benchmark_runs(session, target_id)
+    runs = list_benchmark_runs(session, target_id, limit=1)
     latest = get_benchmark_run(session, runs[0].id) if runs else None
     best = _best_benchmark_result(latest)
     state = session.get(OptimizerStateRecord, target_id)
@@ -306,10 +321,12 @@ def delete_target_page(target_id: int, confirm: bool = Form(False),
 
 @router.get("/targets/{target_id}", response_class=HTMLResponse, name="target_detail",
             dependencies=[Depends(require_admin)])
-def target_detail(target_id: int, request: Request, session: Session = Depends(get_session)):
+def target_detail(target_id: int, request: Request, limit: int = 50, offset: int = 0,
+                  session: Session = Depends(get_session)):
     target = get_target_or_404(session, target_id)
-    runs = list_benchmark_runs(session, target_id)
-    latest = get_benchmark_run(session, runs[0].id) if runs else None
+    runs = list_benchmark_runs(session, target_id, limit=limit, offset=offset)
+    latest_run_list = runs if offset == 0 else list_benchmark_runs(session, target_id, limit=1)
+    latest = get_benchmark_run(session, latest_run_list[0].id) if latest_run_list else None
     state = session.get(OptimizerStateRecord, target_id)
     current = next((item for item in latest.results if state and item.ip == state.current_rewrite_ip), None) if latest else None
     best = _best_benchmark_result(latest)
@@ -318,7 +335,8 @@ def target_detail(target_id: int, request: Request, session: Session = Depends(g
         current_ip_override=(state.current_rewrite_ip if state else
                              latest.summary.get("current_rewrite_ip") if latest else None),
         rewrite_result=request.query_params.get("rewrite"),
-        runs=runs, rewrite_history=list_rewrite_history(session, target_id)))
+        runs=runs, rewrite_history=list_rewrite_history(session, target_id, limit=limit, offset=offset),
+        limit=limit, offset=offset))
 
 
 @router.post("/targets/{target_id}/run", name="run_target_now",
@@ -343,7 +361,7 @@ def run_target_now(target_id: int, request: Request, session: Session = Depends(
     logger.info("Manual benchmark accepted target_id=%d state=%s queue_position=%s",
                 target_id, run_status, queue_position)
     if request.headers.get("HX-Request", "").lower() == "true":
-        runs = list_benchmark_runs(session, target_id)
+        runs = list_benchmark_runs(session, target_id, limit=1)
         latest = get_benchmark_run(session, runs[0].id) if runs else None
         return templates.TemplateResponse(request, "run_state.html", _base_context(
             request, target=target, run_status=run_status, queue_position=queue_position,
@@ -360,7 +378,7 @@ def apply_best_rewrite(target_id: int, run_id: int = Form(...), old_ip: str = Fo
         raise HTTPException(status_code=400, detail="Explicit rewrite confirmation is required")
     target = get_target_or_404(session, target_id)
     run = get_benchmark_run(session, run_id)
-    runs = list_benchmark_runs(session, target_id)
+    runs = list_benchmark_runs(session, target_id, limit=1)
     if not run or run.target_id != target_id or not runs or runs[0].id != run_id:
         raise HTTPException(status_code=409, detail="Apply Best IP requires the latest benchmark result")
     if (run.summary.get("resolution_failed")

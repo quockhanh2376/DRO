@@ -42,7 +42,7 @@ sudo chmod 600 /etc/dro/dro.env
 alembic upgrade head
 ```
 
-The web pages and API require login except `/login`, `/health`, and `/api/v1/system/status`. All mutation routes require a valid CSRF token. Login initializes the admin hash the first time the configured credentials are used.
+The web pages and API require login except `/login` and `/health`. `/api/v1/system/status` requires admin authentication to avoid leaking internal metrics. All mutation routes require a valid CSRF token. Login is rate-limited by client IP, and initializes the admin hash the first time the configured credentials are used.
 
 ## Current Production State (2026-09-27)
 
@@ -50,7 +50,7 @@ DRO release candidate `v1.0.0-rc.1` is deployed on `172.16.10.9` at `/opt/dro`, 
 
 Production currently has the scheduler enabled, a 60-minute default interval, 5-day application log retention, benchmark-history retention of 72 hours, and a five-per-day automatic rewrite limit. Per-target intervals govern scheduled runs. The global Automatic DNS Rewrite gate and per-target Auto Apply are enabled for the two configured targets; existing safety rules still apply. Benchmark runs, aggregate results, and samples are retained together for the configured history period; Runtime Settings allows an hours/days override. Rewrite history is retained indefinitely. The deployment includes the HTMX inline Run Now result, verified Apply Best IP action, and editable interval, scheduler, and retention settings. Manual Run Now benchmarks remain read-only. The legacy `dns-optimizer.timer` is disabled, while `/opt/dns-optimizer` remains available for rollback.
 
-Nginx must forward `Host $host`, `X-Forwarded-Host $host`, and `X-Forwarded-Proto $scheme`. Uvicorn accepts proxy headers only from `127.0.0.1`; keep the backend listener loopback-only. Set `DRO_HTTPS_ENABLED=true` in `/etc/dro/dro.env` so session cookies are Secure.
+Nginx must forward `Host $host`, `X-Forwarded-Host $host`, and `X-Forwarded-Proto $scheme`. Uvicorn accepts proxy headers only from `127.0.0.1`; keep the backend listener loopback-only. Set `DRO_HTTPS_ENABLED=true` in `/etc/dro/dro.env` so session cookies are Secure (https_only). Standard security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `Content-Security-Policy`) are enabled by default.
 
 ## Ubuntu service installation
 

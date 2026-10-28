@@ -47,11 +47,32 @@ def create_app(database: Database | None = None, benchmark_cycle=run_benchmark_c
                 scheduler_database.close()
 
     application = FastAPI(title="DRO API", version=__version__, lifespan=lifespan)
+
+    session_secret = os.getenv("DRO_SESSION_SECRET")
+    if not session_secret:
+        logging.getLogger(__name__).warning(
+            "DRO_SESSION_SECRET is not set; generated a transient session secret. "
+            "User sessions will be invalidated on server restart and cannot be shared across multiple workers."
+        )
+        session_secret = secrets.token_urlsafe(48)
+
     application.add_middleware(
-        SessionMiddleware, secret_key=os.getenv("DRO_SESSION_SECRET") or secrets.token_urlsafe(48),
+        SessionMiddleware, secret_key=session_secret,
         session_cookie="dro_session", max_age=12 * 60 * 60, same_site="lax",
         https_only=os.getenv("DRO_HTTPS_ENABLED", "false").lower() in {"1", "true", "yes"},
     )
+
+    @application.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+        )
+        return response
     application.state.database = scheduler_database
     application.state.benchmark_cycle = benchmark_cycle
     application.state.run_coordinator = coordinator

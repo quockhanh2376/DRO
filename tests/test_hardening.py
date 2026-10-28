@@ -497,3 +497,90 @@ def test_sqlite_backup_restore_and_invalid_restore_validation(tmp_path):
     invalid.write_text("not a db")
     with pytest.raises(ValueError, match="Invalid SQLite"):
         restore_database(invalid, live, confirmed=True)
+
+
+def test_login_rate_limiting_and_audit(tmp_path, monkeypatch):
+    from app.auth import login_rate_limiter, reset_auth_cache
+    login_rate_limiter.reset()
+    reset_auth_cache()
+    monkeypatch.setenv("DRO_ADMIN_USER", "admin")
+    monkeypatch.setenv("DRO_ADMIN_PASSWORD", "strong-test-password-123")
+    db = Database(f"sqlite:///{(tmp_path / 'rate_limit.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+    with TestClient(create_app(database=db)) as client:
+        for _ in range(5):
+            page = client.get("/login")
+            token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+            resp = client.post("/login", data={"username": "admin", "password": "wrong-password", "csrf_token": token})
+            assert resp.status_code == 401
+            assert "Invalid username or password" in resp.text
+
+        page = client.get("/login")
+        token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+        resp = client.post("/login", data={"username": "admin", "password": "wrong-password", "csrf_token": token})
+        assert resp.status_code == 429
+        assert "Too many failed login attempts" in resp.text
+
+        with db.session() as session:
+            failures = list(session.scalars(select(AuditLogRecord).where(AuditLogRecord.event == "login_failed")).all())
+            assert len(failures) == 5
+
+        login_rate_limiter.reset()
+        page = client.get("/login")
+        token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+        resp = client.post("/login", data={"username": "admin", "password": "strong-test-password-123", "csrf_token": token}, follow_redirects=False)
+        assert resp.status_code == 303
+    db.close()
+    login_rate_limiter.reset()
+
+
+def test_login_verification_caching_and_timing_dummy(tmp_path, monkeypatch):
+    from app.auth import verify_login, reset_auth_cache
+    import app.auth as auth_mod
+    reset_auth_cache()
+    monkeypatch.setenv("DRO_ADMIN_USER", "admin")
+    monkeypatch.setenv("DRO_ADMIN_PASSWORD", "strong-test-password-123")
+    db = Database(f"sqlite:///{(tmp_path / 'cache_test.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+    with db.session() as session:
+        assert verify_login(session, "admin", "strong-test-password-123") is True
+        assert verify_login(session, "wrong_user", "strong-test-password-123") is False
+        assert verify_login(session, "admin", "wrong_password_123") is False
+
+        assert auth_mod._VERIFIED_CONFIGURED_CREDENTIAL is not None
+        cached_before = auth_mod._VERIFIED_CONFIGURED_CREDENTIAL
+
+        assert verify_login(session, "admin", "strong-test-password-123") is True
+        assert auth_mod._VERIFIED_CONFIGURED_CREDENTIAL == cached_before
+    db.close()
+
+
+def test_security_headers_and_session_secret_warning(tmp_path, monkeypatch):
+    import logging
+    monkeypatch.delenv("DRO_SESSION_SECRET", raising=False)
+    monkeypatch.setenv("DRO_ADMIN_USER", "admin")
+    monkeypatch.setenv("DRO_ADMIN_PASSWORD", "strong-test-password-123")
+    db = Database(f"sqlite:///{(tmp_path / 'headers.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    logger = logging.getLogger("app.api.application")
+    records = []
+    class RecordHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+    handler = RecordHandler()
+    logger.addHandler(handler)
+    try:
+        app = create_app(database=db)
+        assert any("DRO_SESSION_SECRET is not set" in r.getMessage() for r in records)
+    finally:
+        logger.removeHandler(handler)
+
+    with TestClient(app) as client:
+        resp = client.get("/login")
+        assert resp.status_code == 200
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["referrer-policy"] == "same-origin"
+        assert "default-src 'self'" in resp.headers["content-security-policy"]
+    db.close()

@@ -450,3 +450,35 @@ def test_adguard_check_is_read_only_and_hides_credentials(monkeypatch, capsys):
     assert '"rewrite_count": 1' in output
     assert "private" not in output and "user" not in output
     assert calls == ["GET rewrite/list"]
+
+
+def test_sanitize_for_storage_cache_and_ip_protection(monkeypatch):
+    from app.security import sanitize_for_storage, reset_secret_cache, get_secret_values
+    reset_secret_cache()
+    monkeypatch.setenv("TEST_APP_PASSWORD", "super-secret-pass-999")
+    monkeypatch.setenv("TEST_SERVER_IP_TOKEN", "192.168.1.100")
+    monkeypatch.setenv("TEST_SECRET_SHORT", "abc")
+
+    secrets = get_secret_values()
+    assert "super-secret-pass-999" in secrets
+    assert "192.168.1.100" not in secrets
+    assert "abc" not in secrets
+
+    data = {
+        "password": "should_be_stripped",
+        "nested": {
+            "token": "also_stripped",
+            "message": "Connecting to 192.168.1.100 with super-secret-pass-999 and token abc",
+        },
+        "sample_ips": ["192.168.1.100", "1.1.1.1"],
+    }
+    cleaned = sanitize_for_storage(data)
+    assert "password" not in cleaned
+    assert "token" not in cleaned["nested"]
+    assert "super-secret-pass-999" not in cleaned["nested"]["message"]
+    assert "[REDACTED]" in cleaned["nested"]["message"]
+    assert "192.168.1.100" in cleaned["nested"]["message"]
+    assert "abc" in cleaned["nested"]["message"]
+    assert cleaned["sample_ips"] == ["192.168.1.100", "1.1.1.1"]
+
+    reset_secret_cache()

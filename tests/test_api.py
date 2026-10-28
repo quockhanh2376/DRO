@@ -99,3 +99,58 @@ def test_api_manual_run_rejects_concurrent_target_run(api):
         response = client.post(f"/api/v1/targets/{target['id']}/run")
     assert response.status_code == 409
     assert response.json()["detail"] == "A benchmark is already running for this target"
+
+
+def test_api_runs_and_rewrite_pagination_and_status_auth(api, tmp_path):
+    client, database = api
+    target = client.post("/api/v1/targets", json={"hostname": "paginate.example"}).json()
+    t_id = target["id"]
+
+    # Add 5 benchmark runs and 5 rewrite history entries
+    from datetime import datetime, timezone, timedelta
+    from app.models.benchmark import BenchmarkResult, DecisionResult
+    now = datetime.now(timezone.utc)
+    with database.session() as session:
+        for i in range(5):
+            res = BenchmarkResult(ip="1.2.3.4", valid_runs=1, requested_runs=1, healthy=True, average_ms=10.0 + i)
+            dec = DecisionResult(action="KEEP", reason=f"run-{i}")
+            run = save_benchmark_run(session, t_id, [res], {}, dec)
+            run.completed_at = now - timedelta(minutes=10 - i)
+            add_rewrite_history(session, t_id, f"1.1.1.{i}", f"1.1.1.{i+1}", f"reason-{i}")
+        session.commit()
+
+    # Test limit and offset on runs
+    runs_p1 = client.get(f"/api/v1/targets/{t_id}/runs?limit=2&offset=0").json()
+    assert len(runs_p1) == 2
+    assert runs_p1[0]["decision_reason"] == "run-4"  # most recent
+    assert runs_p1[1]["decision_reason"] == "run-3"
+
+    runs_p2 = client.get(f"/api/v1/targets/{t_id}/runs?limit=2&offset=2").json()
+    assert len(runs_p2) == 2
+    assert runs_p2[0]["decision_reason"] == "run-2"
+    assert runs_p2[1]["decision_reason"] == "run-1"
+
+    runs_p3 = client.get(f"/api/v1/targets/{t_id}/runs?limit=2&offset=4").json()
+    assert len(runs_p3) == 1
+    assert runs_p3[0]["decision_reason"] == "run-0"
+
+    # Test limit and offset on rewrite-history
+    rewrites_p1 = client.get(f"/api/v1/targets/{t_id}/rewrite-history?limit=2&offset=0").json()
+    assert len(rewrites_p1) == 2
+    assert rewrites_p1[0]["reason"] == "reason-4"
+
+    rewrites_p2 = client.get(f"/api/v1/targets/{t_id}/rewrite-history?limit=2&offset=2").json()
+    assert len(rewrites_p2) == 2
+    assert rewrites_p2[0]["reason"] == "reason-2"
+
+    # Test parameter validation limits
+    assert client.get(f"/api/v1/targets/{t_id}/runs?limit=0").status_code == 422
+    assert client.get(f"/api/v1/targets/{t_id}/runs?limit=501").status_code == 422
+    assert client.get(f"/api/v1/targets/{t_id}/runs?offset=-1").status_code == 422
+
+    # Test system/status requires authentication (Item 4)
+    with TestClient(create_app(database=database)) as unauth_client:
+        # Public health endpoint is 200
+        assert unauth_client.get("/health").status_code == 200
+        # system/status requires admin auth
+        assert unauth_client.get("/api/v1/system/status").status_code == 401

@@ -877,3 +877,58 @@ def test_manual_benchmark_queue_runs_two_then_fifo_and_updates_independent_rows(
     finally:
         for event in release.values():
             event.set()
+
+
+def test_dashboard_rows_and_latest_run_map_query_count(tmp_path):
+    from sqlalchemy import event
+    from app.web.routes import _latest_run_map, _dashboard_rows
+    from app.db.repositories import save_benchmark_run, list_targets
+    from datetime import datetime, timezone, timedelta
+    from app.models.benchmark import BenchmarkResult, DecisionResult
+
+    db = Database(f"sqlite:///{(tmp_path / 'query_count.db').as_posix()}")
+    Base.metadata.create_all(db.engine)
+
+    with db.session() as session:
+        t1 = save_target(session, Target(hostname="t1.example"))
+        t2 = save_target(session, Target(hostname="t2.example"))
+        t3 = save_target(session, Target(hostname="t3.example"))
+        t1_id, t2_id, t3_id = t1.id, t2.id, t3.id
+
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            res = BenchmarkResult(ip=f"1.1.1.{i}", valid_runs=1, requested_runs=1, healthy=True, average_ms=10.0 + i)
+            dec = DecisionResult(action="KEEP", reason="test")
+            run = save_benchmark_run(session, t1_id, [res], {}, dec)
+            run.completed_at = now - timedelta(hours=5 - i)
+            session.flush()
+
+        for j in range(3):
+            res = BenchmarkResult(ip=f"2.2.2.{j}", valid_runs=1, requested_runs=1, healthy=True, average_ms=20.0 + j)
+            dec = DecisionResult(action="KEEP", reason="test")
+            run = save_benchmark_run(session, t2_id, [res], {}, dec)
+            run.completed_at = now - timedelta(hours=3 - j)
+            session.flush()
+        session.commit()
+
+    with db.session() as session:
+        targets = list_targets(session)
+        latest_map = _latest_run_map(session, targets)
+        assert len(latest_map) == 2
+        assert t1_id in latest_map and t2_id in latest_map and t3_id not in latest_map
+
+        t1_run, t1_best = latest_map[t1_id]
+        assert t1_best.average_ms == 14.0
+
+        queries = []
+        def receive_before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+            queries.append(statement)
+
+        event.listen(db.engine, "before_cursor_execute", receive_before_cursor_execute)
+        try:
+            rows = _dashboard_rows(session)
+            assert len(rows) == 3
+            assert len(queries) <= 5, f"Expected <= 5 queries, got {len(queries)}: {queries}"
+        finally:
+            event.remove(db.engine, "before_cursor_execute", receive_before_cursor_execute)
+    db.close()
